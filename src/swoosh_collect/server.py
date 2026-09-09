@@ -761,9 +761,12 @@ class Handler(BaseHTTPRequestHandler):
                 "duration_s": round(r.duration_s, 1),
                 "stopped_by": r.stopped_by,
                 "complete": r.complete,
-                "status": r.status,          # recording | processing | ready
+                "status": r.status,   # recording | stopped | processing | ready
                 "timestamp": r.timestamp,
                 "error": r.meta.get("processing_error"),
+                # health verdict, written when processing finished
+                "checks_ok": r.meta.get("checks_ok"),
+                "checks_reasons": r.meta.get("checks_reasons") or [],
             })
         return {"name": c.name, "slug": c.path.name, "path": str(c.path),
                 "runs": runs, "complete": sum(r["complete"] for r in runs)}
@@ -1118,6 +1121,8 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
 .run:hover{border-color:var(--blue)} .run.sel{border-color:var(--blue);background:#eaf2fe}
 .run .n{font-weight:700;font-variant-numeric:tabular-nums}
 .run .d{color:var(--dim);margin-left:auto;font-variant-numeric:tabular-nums}
+/* counting up right now -- red like the recording tag, so the two agree */
+.run .d.live{color:var(--red);font-weight:700}
 .run .ts{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
 .run .meta{display:flex;flex-direction:column;gap:1px;min-width:0}
 .dot{width:7px;height:7px;background:var(--green);flex:none}
@@ -1128,6 +1133,8 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
 /* stopped: no longer recording, not yet processed -- neutral, and NOT pulsing,
    so it is obvious at a glance that the run is no longer live */
 .tag.stopped{background:var(--ink-3,#767d86)}
+.tag.okchecks{background:var(--green)}
+.tag.badchecks{background:var(--red)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
 @keyframes wig{0%,100%{transform:translateX(0)}15%{transform:translateX(-7px)}30%{transform:translateX(6px)}
  45%{transform:translateX(-5px)}60%{transform:translateX(4px)}75%{transform:translateX(-2px)}}
@@ -1393,12 +1400,23 @@ async function loadCampaign(){
     const d=document.createElement('div');
     d.className='run'+(SEL===r.name?' sel':''); d.id='run_'+r.name;
     const TAGTEXT={recording:'recording',stopped:'stopped',processing:'processing'};
-    const tag=r.status==='ready'?'':
+    let tag=r.status==='ready'?'':
       `<span class="tag ${r.status}">${TAGTEXT[r.status]||r.status}</span>`;
+    // Health verdict, once processing has produced one. A run that failed its checks
+    // must be obvious on the card -- it is what the exporter will refuse.
+    if(r.status==='ready' && r.checks_ok!=null){
+      tag += r.checks_ok
+        ? `<span class="tag okchecks" title="all health checks passed">checks passed</span>`
+        : `<span class="tag badchecks" title="${esc(r.checks_reasons.join('; '))}"
+             >checks failed</span>`;
+    }
     d.innerHTML=`<span class="dot${r.complete?'':' bad'}"></span>
       <div class=meta><div><span class=n>${String(r.index).padStart(4,'0')}</span> ${tag}</div>
       <div class=ts>${r.timestamp||''}</div></div>
-      <span class=d title="HH:MM:SS -- shown once processing is done">${r.status==='ready'?hms(r.duration_s):'--:--:--'}</span>
+      <span class="d${r.status==='recording'?' live':''}" data-run="${r.name}"
+        title="HH:MM:SS -- counts up while recording, final once processed"
+        >${r.status==='ready'?hms(r.duration_s)
+            :(r.status==='recording'?hms(0):'--:--:--')}</span>
       <button class=iconbtn title="open this run's folder">Open run folder</button>
       <button class="iconbtn del" title="delete this run permanently">Delete</button>`;
     d.querySelector('.iconbtn').onclick=e=>{e.stopPropagation();openFolder(r.name)};
@@ -1512,6 +1530,12 @@ es.onmessage=e=>{ LIVE=JSON.parse(e.data);
     if(st.cameras && st.cameras.join()!==CAMS.join()) camGrid(st.cameras,false);
     // Refresh the run list the moment recording starts or stops, instead of waiting
     // for the 4 s poll -- that delay made the tag look stuck on "recording" after B.
+    // Live timer on the recording card. The SSE carries elapsed at 15 Hz, so the
+    // card counts up without waiting on the 4 s run-list poll.
+    if(st.recording && st.run_name!=null){
+      const cell=document.querySelector(`#runs .d[data-run="${st.run_name}"]`);
+      if(cell) cell.textContent=hms(st.elapsed||0);
+    }
     const nowRec=!!st.recording;
     if(nowRec!==WASREC){ WASREC=nowRec; loadCampaign();
       // and again shortly after, to catch stopped -> processing -> ready

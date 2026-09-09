@@ -51,7 +51,45 @@ from .xbox import XboxPad
 STOP = threading.Event()
 
 
-def _process_run_async(run_dir: Path, cfg: dict, inflight: set) -> None:
+def _health_check(run_dir: Path, cfg: dict, log) -> tuple[bool, list[str]]:
+    """Validate a just-finished run and report a plain pass/fail with reasons.
+
+    Runs the moment processing completes, so a bad episode is known while the operator
+    is still at the rig rather than at export time -- an arm error, a camera that
+    stopped early, a stream on the wrong clock. The verdict goes into run.json so the
+    run card and the exporter both see it.
+    """
+    from .validate import validate_run
+
+    try:
+        res = validate_run(run_dir, cfg)
+    except Exception as exc:
+        reasons = [f"health check itself failed: {type(exc).__name__}: {exc}"]
+        set_run_status(run_dir, "ready", validation={"ok": False, "checks": []},
+                       checks_ok=False, checks_reasons=reasons)
+        log(f"[health] {run_dir.name}: CHECKS FAILED -- {reasons[0]}", err=True)
+        return False, reasons
+
+    fails = [c["check"] for c in res.get("checks", []) if c.get("level") == "fail"]
+    warns = [c["check"] for c in res.get("checks", []) if c.get("level") == "warn"]
+    ok = bool(res.get("ok"))
+    # store alongside the run so the exporter's refusal and the card agree
+    set_run_status(run_dir, "ready", validation=res, checks_ok=ok,
+                   checks_reasons=fails)
+    if ok:
+        log(f"[health] {run_dir.name}: CHECKS PASSED"
+            + (f" ({len(warns)} warning(s): {', '.join(warns)})" if warns else ""))
+    else:
+        log(f"[health] {run_dir.name}: CHECKS FAILED -- {len(fails)} failure(s)",
+            err=True)
+        for c in res.get("checks", []):
+            if c.get("level") == "fail":
+                log(f"  FAIL  {c['check']}: {c.get('detail', '')}", err=True)
+    return ok, fails
+
+
+def _process_run_async(run_dir: Path, cfg: dict, inflight: set,
+                       log=None) -> None:
     """Summarise a finished run in a SEPARATE, nice'd PROCESS.
 
     Not a thread: encoding a summary video peaks around 8 GB of RAM for a five-minute
@@ -76,10 +114,19 @@ def _process_run_async(run_dir: Path, cfg: dict, inflight: set) -> None:
             if proc.returncode != 0:
                 set_run_status(run_dir, "ready",
                                processing_error=(err or "").strip()[-400:])
+                if log:
+                    log(f"[health] {run_dir.name}: summarise failed -- "
+                        f"{(err or '').strip()[-200:]}", err=True)
             else:
                 set_run_status(run_dir, "ready")
+            # Health check last, so its verdict is what lands in run.json.
+            if log:
+                _health_check(run_dir, cfg, log)
         except Exception as exc:
             set_run_status(run_dir, "ready", processing_error=f"{type(exc).__name__}: {exc}")
+            if log:
+                log(f"[health] {run_dir.name}: processing raised "
+                    f"{type(exc).__name__}: {exc}", err=True)
         finally:
             inflight.discard(run_dir.name)
 
@@ -434,7 +481,7 @@ def main() -> int:
                     })
                     next_tick = time.monotonic()
                     completed += 1
-                    _process_run_async(run_dir, cfg, inflight)  # -> `processing` then `ready`
+                    _process_run_async(run_dir, cfg, inflight, LOG)  # -> processing -> ready
                     hint = f"saved {run_dir.name} ({meta['duration_s']:.1f}s) - processing"
                     LOG(f"[collect] B -> saved {run_dir.name}, "
                         f"{meta['duration_s']:.1f}s, now processing")
@@ -692,7 +739,7 @@ def main() -> int:
             rec.close("signal", {"cameras": rig.status() if rig else [],
                                  "provenance": snapshot(cfg, arm)})
             if run_dir is not None:
-                _process_run_async(run_dir, cfg, inflight)
+                _process_run_async(run_dir, cfg, inflight, LOG)
         pad.stop()
         arm.shutdown()
         # Give a still-running summariser a moment before the process exits.
