@@ -20,6 +20,7 @@ frames at 30 Hz would cost more CPU than the control loop itself.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -254,6 +255,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self._campaign_json())
         elif path == "/api/workspace":
             self._json({"box": get(self.cfg, "control.workspace_box_mm", {})})
+        elif path == "/api/root":
+            from .campaign import campaigns_root
+            self._json({"configured": str(get(self.cfg, "recording.campaigns_dir", "campaigns")),
+                        "resolved": str(campaigns_root(self.cfg))})
         elif path == "/api/events":
             self._events()
         elif path.startswith("/stream/"):
@@ -308,6 +313,8 @@ class Handler(BaseHTTPRequestHandler):
             self._save_cameras(body)
         elif path == "/api/workspace":
             self._set_workspace(body)
+        elif path == "/api/root":
+            self._set_root(body)
         elif path == "/api/button":
             name = str(body.get("button", ""))
             if name not in {"start_episode", "stop_episode", "rehome", "quit"}:
@@ -332,6 +339,10 @@ class Handler(BaseHTTPRequestHandler):
         }
         if action == "lag":
             ok = self.sanity.start_fn("lag", self._lag_check)
+        elif action == "fkcheck":
+            ok = self.sanity.start_fn("fkcheck", self._fk_check)
+        elif action == "reach":
+            ok = self.sanity.start_fn("reach", self._reach_check)
         elif action == "camlatency":
             ok = self.sanity.start_fn("camlatency", self._camera_latency)
         elif action == "validate":
@@ -411,6 +422,91 @@ class Handler(BaseHTTPRequestHandler):
                 f"minimum inside the sweep.")
             log("This is the check lego_assemblies lacked; it is what catches a")
             log("time-misaligned action before the data is used.")
+
+    def _fk_check(self, log: Any) -> None:
+        """Is the xArm7 DH table behind the 3D view actually right?
+
+        Compares FK(joint angles) with the TCP pose the CONTROLLER reports for the same
+        instant. They should agree to within the TCP offset (the controller reports the
+        tool point; our FK stops at the flange). A large or pose-dependent disagreement
+        means the table is wrong and the 3D arm is decorative fiction.
+        """
+        import numpy as np
+
+        from .kinematics import fk_pose_mm
+
+        arm = self.arm_ref.get("arm")
+        if arm is None:
+            log("no arm in this process -- run this from swoosh-collect")
+            return
+        if getattr(arm, "is_simulated", False):
+            log("SIMULATED arm: its joint angles are smooth wobble, not an IK solution")
+            log("for its pose, so FK and the reported pose are unrelated BY DESIGN.")
+            log("This check only means something against the real robot.")
+            return
+        st = arm.read_state(0.0)
+        if not st.joints_deg or not st.pose_base:
+            log("arm did not report joints and pose")
+            return
+        fk = fk_pose_mm(st.joints_deg)
+        rep = np.asarray(st.pose_base[:3], dtype=float)
+        d = rep - fk
+        log(f"  joints  {[round(v, 1) for v in st.joints_deg]}")
+        log(f"  FK flange   {[round(float(v), 1) for v in fk]} mm")
+        log(f"  controller  {[round(float(v), 1) for v in rep]} mm")
+        log(f"  difference  {[round(float(v), 1) for v in d]} mm "
+            f"(norm {float(np.linalg.norm(d)):.1f})")
+        try:
+            code, off = arm.api.get_tcp_offset()
+            log(f"  controller TCP offset: {off if code == 0 else 'unavailable'}")
+            log("  -> the difference SHOULD be about the TCP offset, since our FK stops")
+            log("     at the flange and the controller reports the tool point.")
+        except Exception:
+            pass
+        n = float(np.linalg.norm(d))
+        if n < 200:
+            log(f"OK: FK and the controller agree to {n:.0f} mm -- plausible for a "
+                f"flange-vs-tool difference. The DH table looks right.")
+        else:
+            log(f"WARNING: {n:.0f} mm apart. That is too large to be a TCP offset; the "
+                f"DH table in kinematics.py / armfk.js is probably wrong, so the 3D "
+                f"arm's pose is not trustworthy.")
+
+    def _reach_check(self, log: Any) -> None:
+        """Are all eight corners of the safety box actually reachable?
+
+        A box corner outside the arm's workspace lets the target integrate somewhere
+        the arm can never follow: the arm freezes and the recorded action does nothing.
+        """
+        import itertools
+
+        arm = self.arm_ref.get("arm")
+        if arm is None:
+            log("no arm in this process -- run this from swoosh-collect")
+            return
+        box = get(self.cfg, "control.workspace_box_mm", {})
+        from .frames import world_to_base
+        import numpy as np
+
+        bad = 0
+        for cx, cy, cz in itertools.product(box["x"], box["y"], box["z"]):
+            base = world_to_base(np.array([cx, cy, cz], dtype=float))
+            pose = [*base.tolist(), 180.0, 0.0, 0.0]
+            try:
+                code, _ = arm.api.get_inverse_kinematics(pose, input_is_radian=False,
+                                                         return_is_radian=False)
+            except Exception as exc:
+                log(f"  IK call failed: {exc}")
+                return
+            ok = (code == 0)
+            bad += not ok
+            log(f"  world ({cx:6.0f},{cy:6.0f},{cz:6.0f}) -> "
+                f"{'reachable' if ok else f'UNREACHABLE (code {code})'}")
+        if bad:
+            log(f"{bad}/8 corners unreachable. Shrink the box in the 3D scene panel, or "
+                f"the target can run away where the arm cannot follow.")
+        else:
+            log("all 8 corners reachable")
 
     def _camera_latency(self, log: Any) -> None:
         """Measure ACTION -> PIXEL latency by commanding the gripper and watching for it.
@@ -499,6 +595,30 @@ class Handler(BaseHTTPRequestHandler):
             set_value("control.workspace_box_mm", clean)
             self.live.set_workspace(clean)
             self._json({"ok": True, "box": clean})
+        except Exception as exc:
+            self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
+
+    def _set_root(self, body: dict) -> None:
+        """Point campaigns/ somewhere else -- an external drive, say. A relative path
+        resolves against the repo root; an absolute one is used as-is."""
+        from pathlib import Path as _P
+
+        from .campaign import campaigns_root
+        from .config import set_value
+
+        raw = str(body.get("path", "")).strip()
+        if not raw:
+            self._json({"ok": False, "error": "no path given"}, 400)
+            return
+        try:
+            self.cfg.setdefault("recording", {})["campaigns_dir"] = raw
+            root = campaigns_root(self.cfg)
+            root.mkdir(parents=True, exist_ok=True)
+            if not os.access(root, os.W_OK):
+                raise PermissionError(f"{root} is not writable")
+            set_value("recording.campaigns_dir", raw)
+            self.sanity.log(f"campaign root -> {root}")
+            self._json({"ok": True, "configured": raw, "resolved": str(root)})
         except Exception as exc:
             self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
 
@@ -855,10 +975,12 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
     <div class=hd>
       <h1 id=cname>...</h1>
       <div class=sub id=csub></div>
-      <div style="margin-top:8px;display:flex;gap:6px">
+      <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
         <button class=blue onclick=newCampaign()>+ New campaign</button>
+        <button onclick=chooseRoot()>Choose root folder</button>
         <button onclick="openFolder('')">Open campaign folder</button>
       </div>
+      <div class=sub id=rootpath style="margin-top:6px;font-size:11px;word-break:break-all"></div>
     </div>
     <div id=runs></div>
   </div>
@@ -875,6 +997,8 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
       <button class=sbtn onclick=nameCameras() title="Assign labels to cameras by USB port.">name cameras</button>
       <button class=sbtn onclick="sanity('lag')" title="Sweep lag on the latest run; a U-shaped minimum means the action is time-aligned.">cmd&rarr;measured lag</button>
       <button class="sbtn red" onclick=confirmCamLatency() title="MOVES THE GRIPPER: measures action-to-pixel latency.">camera latency</button>
+      <button class=sbtn onclick="sanity('fkcheck')" title="Compare FK(joints) with the controller's own TCP pose -- verifies the DH table behind the 3D view.">FK check</button>
+      <button class=sbtn onclick="sanity('reach')" title="Are all 8 corners of the safety box reachable?">workspace reach</button>
       <button class=sbtn onclick="sanity('validate')" title="Check every run for the known failure modes.">validate runs</button>
       <button class=sbtn onclick="sanity('preview')" id=pvbtn title="Feed the dashboard synthetic data (no hardware).">preview mode</button>
     </div>
@@ -919,12 +1043,6 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
     </div>
   </div>
 </div>
-</div>
-<div id=pbbar class=off>
-  <button id=pbtn onclick=togglePlay()>Play</button>
-  <button id=pstop onclick=stopPlay()>Stop</button>
-  <div id=pbslider></div>
-  <span id=ptime class=sub style="font-variant-numeric:tabular-nums">0.0 / 0.0 s</span>
 </div>
 <div id=modal><div class=mbox id=mbox></div></div>
 <style>__NOUI_CSS__</style>
@@ -1212,6 +1330,32 @@ function buildWsFields(box){
   });
 }
 setTicker('LIVE','green');
+async function loadRoot(){
+  try{ const r=await (await fetch('/api/root')).json();
+    rootpath.textContent='campaigns are written to  '+r.resolved; }catch(e){}
+}
+function chooseRoot(){
+  fetch('/api/root').then(r=>r.json()).then(cur=>{
+    showModal(`<h4>Choose root folder</h4>
+      <p>Where campaigns are written. A relative path resolves against the repo; an
+      absolute path (an external drive, say) is used as-is. Created if missing.</p>
+      <div class=mrow><label>path</label>
+        <input id=rootin style="flex:2" value="${cur.configured}"></div>
+      <div class=sub style="font-size:11px">currently: ${cur.resolved}</div>
+      <div class=mact><button onclick=closeModal()>Cancel</button>
+      <button class=blue onclick=saveRoot()>Set</button></div>`);
+    const i=document.getElementById('rootin'); i.focus();
+    i.onkeydown=e=>{ if(e.key==='Enter') saveRoot(); };
+  });
+}
+async function saveRoot(){
+  const path=(document.getElementById('rootin').value||'').trim(); if(!path) return;
+  const r=await (await fetch('/api/root',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({path})})).json();
+  if(!r.ok){ toast(r.error); return; }
+  closeModal(); loadRoot(); loadCampaign();
+}
+loadRoot();
 loadCampaign(); setInterval(loadCampaign,4000);
 </script></body></html>"""
 

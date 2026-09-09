@@ -19,20 +19,20 @@ swoosh-campaign new "lego-pick-place"      # creates campaigns/lego-pick-place/
 ```
 
 That is the only step. The folder is made for you, and every run you record lands
-inside it, numbered and timestamped:
+inside it, named by timestamp:
 
 ```
-campaigns/
+campaigns/                          <- gitignored; move it with "choose root folder"
   lego-pick-place/                  <- created by the command above
     campaign.json
     index.html                      <- offline review page
-    run_0001_20260908_231500/
-      run.json                      <- status, duration, how it ended
+    recording_2026_09_09_01_21_23/
+      run.json                      <- status, duration, provenance, validation
       raw/                          <- authoritative per-stream logs
       video/                        <- one mp4 per camera + frame timestamps
       summary.mp4                   <- 2x2 camera grid, time-synced
       inputs.png  kinematics.png
-    run_0002_20260908_231902/
+    recording_2026_09_09_01_24_07/
     ...
 ```
 
@@ -54,28 +54,61 @@ swoosh-collect --campaign lego-pick-place
 
 ---
 
-## Quick start on a fresh machine
+## Before you can collect: three gates
+
+All three are one button each in the dashboard's **sanity** box (bottom left).
+
+**1. Verify the 45&deg; frame** (the red button). `swoosh-collect` **refuses to start
+until this passes** — deliberately, because a wrong frame silently rotates every action
+and cannot be fixed afterwards. It jogs the end effector 20 mm along world +X, +Y and
++Z in turn; you should see **forward, left, up**. The result is saved, so you only do
+this once (and again if the matrix ever changes).
+
+**2. Check arm.** Among other things this asserts the controller's **world offset is
+zero**. If someone left one from another project, our 45&deg; rotation stacks on top of
+it and everything rotates twice. Clear it in xArm Studio if flagged.
+
+**3. Name cameras.** Nothing records until all four USB ports are labelled.
+
+Then, once you have one recorded run: **cmd&rarr;measured lag** and **camera latency**.
+
+## Practical order at the robot
 
 ```bash
-git clone <this repo> && cd xarm7-data-collection
-docker compose build                                  # ~1 min, no ROS
+docker compose build
 
-# 1. name the cameras once (pins each label to its USB port, survives reboots)
-docker compose run --rm cameras
-
-# 2. check the arm, and verify the 45-degree mount maths against the real robot
+docker compose run --rm cameras                       # name the four cameras
 SANITY_ARGS="--home --verify-frame" docker compose run --rm sanity
 
-# 3. make a campaign and collect
-docker compose run --rm shell -lc 'swoosh-campaign new "my-campaign"'
-CAMPAIGN=my-campaign docker compose run --rm collect
+docker compose run --rm shell -lc 'swoosh-campaign new "test"'
+CAMPAIGN=test docker compose run --rm collect         # A, wiggle it, B
+
+swoosh-validate --campaign test
 ```
 
-A Chrome tab opens on the dashboard automatically.
+A Chrome tab opens on the dashboard automatically. Without Docker, `uv sync` and use
+the `swoosh-*` commands directly.
 
-Without Docker, `uv sync` then use the `swoosh-*` commands directly.
+**Power up first:** the dedicated router, then the xArm controller. Wait until xArm
+Studio at `http://192.168.1.199` loads. Release the e-stop, confirm the gripper is
+attached, and **clear the workspace** — `collision_sensitivity` is 0, so real
+collisions are not caught.
 
----
+## Running with no hardware
+
+```bash
+swoosh-collect --campaign test --simulate
+```
+
+`SimulatedArm` / `SimulatedPad` / `SimulatedCameraRig` stand in for the real ones behind
+the same interfaces, so this exercises the **real** control loop, recorder, dashboard
+and export — not a mock of them. The simulated cameras write real mp4s and real
+timestamp files, so a simulated A-to-B episode produces a genuine run folder that
+summarises, plays back, validates and exports exactly like a real one.
+
+The physics is deliberately crude: the arm follows the commanded pose with a
+first-order lag and the joint angles are smooth bounded wobble, not an IK solution.
+It is not a robot model. The ticker reads `SIMULATED` throughout.
 
 ## Controls
 
@@ -101,11 +134,17 @@ the table.
 
 Opens at `http://127.0.0.1:8770`. Split in half:
 
-- **Left** — campaign name, `+ New campaign`, `Open campaign folder`, and every run
-  listed with its timestamp, duration and status. Each run has its own
-  `folder` button.
-- **Right** — live controller rendering (both sticks and the trigger), live proprio
-  (all 7 joint angles and the end-effector position), and the four camera feeds.
+- **Left** — campaign name, `+ New campaign`, `Choose root folder`, `Open campaign
+  folder`, and every run listed with its timestamp, duration and status, each with its
+  own `Open run folder` button. The **sanity** box is pinned below, with its own
+  embedded terminal and a `copy full logs` button.
+- **Right** — a scrolling status ticker (`LIVE` / `RECORDING` / `PLAY BACK <run>` /
+  `SIMULATED`), the four camera feeds with the playback scrubber beneath them, and
+  below that the controller rendering (sticks, triggers, ABXY), proprioception, and a
+  3D scene showing the arm at its 45&deg; mount with the safety box as a red wireframe
+  and the desired pose as a sphere and arrow.
+
+All three dividers drag.
 
 **Run lifecycle.** Press **A** and the run appears immediately tagged `IN PROGRESS`.
 Press **B** and it becomes `PROCESSING` while the summary video and plots are built on
@@ -130,6 +169,7 @@ its own file. Nothing is merged at write time.
 | `raw/commanded.jsonl` | the target pose we decided on, in **world** coordinates |
 | `raw/xarm_command.jsonl` | the literal arguments handed to `set_servo_cartesian` |
 | `raw/arm_state.jsonl` | joints, measured pose (base **and** world), gripper, errors |
+| `raw/tick.jsonl` | loop health: measured dt, servo code, pad connected |
 | `video/<cam>.mp4` + `_frame_times.json` | each camera with per-frame timestamps |
 
 `commanded` and `xarm_command` look redundant until the frame maths is wrong: the first

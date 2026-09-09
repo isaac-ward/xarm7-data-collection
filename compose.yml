@@ -39,7 +39,7 @@ services:
       - /dev:/dev
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     command: >
-      bash -lc "
+      bash -c "
       ip -4 -brief addr show ${SWOOSH_NIC:-enp129s0} | grep -q '192.168.1.100/'
         || ip addr add 192.168.1.100/24 dev ${SWOOSH_NIC:-enp129s0};
       swoosh-collect --campaign \"$${CAMPAIGN:?set CAMPAIGN=<name>}\" $${COLLECT_ARGS:-}"
@@ -48,7 +48,7 @@ services:
     <<: *base
     volumes: [./:/workspace, /dev:/dev]
     command: >
-      bash -lc "
+      bash -c "
       ip -4 -brief addr show ${SWOOSH_NIC:-enp129s0} | grep -q '192.168.1.100/'
         || ip addr add 192.168.1.100/24 dev ${SWOOSH_NIC:-enp129s0};
       swoosh-sanity $${SANITY_ARGS:-}"
@@ -56,7 +56,7 @@ services:
   cameras:
     <<: *base
     volumes: [./:/workspace, /dev:/dev, /tmp/.X11-unix:/tmp/.X11-unix:rw]
-    command: bash -lc "swoosh-cameras $${CAMERA_ARGS:---assign}"
+    command: bash -c "swoosh-cameras $${CAMERA_ARGS:---assign}"
 
   shell:
     <<: *base

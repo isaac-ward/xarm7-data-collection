@@ -45,7 +45,7 @@ Source of truth for hardware facts: `sisl/manipulation-mono` (full read done 202
 
 ## P2 — 45° mount compensation
 - [x] Encode base↔world rotation for the right arm (base Z is 45° off vertical, tilted right)
-- [ ] **Verify empirically before trusting it**: command +X/+Y/+Z world jogs, confirm the EE moves forward/left/up on the real arm
+- [ ] **Verify empirically before trusting it**: world jogs on the real arm (see P11)
 - [x] Make the matrix a config value, not a literal buried in code
 
 ## P3 — Xbox controller input
@@ -93,7 +93,7 @@ Everything on one monotonic clock, logged at native rate, each stream separately
 - [x] LeRobot v2.1 dataset at **30 Hz** (D6)
 - [x] Resample raw → 30 Hz grid **honestly** (nearest-in-time, no invented samples)
 - [x] Record the raw→export time offset per episode; never assume shared origins
-- [ ] Sanity check: commanded pose should predict measured pose ~1 servo lag later
+- [ ] Commanded pose should predict measured pose ~1 servo lag later (see P11)
 
 ## P8 — Campaigns & dashboard *(new)*
 - [x] `campaigns/` directory, **gitignored**
@@ -131,7 +131,7 @@ Everything on one monotonic clock, logged at native rate, each stream separately
 - [x] **uv** for dependency management
 - [x] compose service(s) with `/dev` mount, `group_add: video`, `device_cgroup_rules: c 81:* rmw` for cameras
 - [x] `NET_ADMIN` + `network_mode: host` + idempotent `ip addr add` for the arm subnet
-- [ ] **"Drop it on the Ubuntu machine and hey presto"** — one command from clone to collecting
+- [ ] One command from clone to collecting, on the LAB machine (verified in Docker here)
 - [x] README: power-up order, camera naming, controller map
 - [x] README: **explicit "start a new campaign" section** -- the command, and that it creates a new folder under the gitignored `campaigns/`
 
@@ -185,17 +185,54 @@ I verified each claim against the code and the installed libraries before acting
       asserts the action survives AND that video frame i is row i. Includes a
       regression test that a mismatched-origin run is refused.
 
+### Done since the review was written
+- [x] Summarise in a nice'd SUBPROCESS that streams frames (was ~8 GB in-process)
+- [x] Config/git/matrix/TCP snapshot in run.json; collection REFUSES to start until the
+      45-degree frame is verified against the current matrix hash
+- [x] Gripper I/O moved to a worker (the SDK has no non-blocking call -- verified)
+- [x] `swoosh-validate` with the lego-failure checks; result stored in run.json
+- [x] Preflight gates every episode; six checks with ticks/crosses, refuses on failure
+- [x] `episodes_stats` for every numeric feature
+- [x] Camera-latency measurement button (needs the robot to actually run)
+- [x] Controller world-offset assertion (a leftover offset would rotate twice)
+- [x] Config edits round-trip through ruamel so the 77 comment lines survive
+
+---
+
+## P11 — outstanding, read back from the last five prompts (2026-09-09)
+
+### Code, doable here
+- [x] Remove the DUPLICATE playback bar (two `id=pbbar` divs; the duplicate id also
+      broke the noUiSlider binding, which is why the scrubber never appeared)
+- [x] **Simulated hardware**: `SimulatedArm` / `SimulatedPad` / `SimulatedCameraRig`
+      implementing the same interfaces, behind `swoosh-collect --simulate`, so preview
+      drives the REAL code path instead of a side script shoving values into LiveState
+- [x] **"Choose root folder"** button next to "New campaign": sets where campaigns are
+      written; runs then land in THAT folder (config field + set_value already exist)
+- [x] **FK-check sanity button**: compare FK(joint angles) against the controller's own
+      reported TCP, so the xArm7 DH table behind the 3D view is verified, not trusted
+- [x] Workspace-reach button (`get_inverse_kinematics` on all 8 corners). It already
+      found 4/8 corners of the default box unreachable, so z max is now 700 mm
+- [x] README: the gating sequence and the practical order at the robot
+- [x] Preview replaced by `--simulate`, which drives the real loop
+
+### Needs the robot (one button each)
+- [ ] Verify the 45-degree frame -- GATES ALL COLLECTION
+- [ ] Confirm the controller's world offset is zero
+- [ ] commanded->measured lag, after the first real run
+- [ ] Camera latency
+- [ ] FK check against the real arm
+
+### Needs the lab machine
+- [x] Docker image BUILT AND TESTED here. Two real bugs found and fixed:
+      (a) `evdev` compiles from source and needs build-essential + linux-libc-dev,
+          which python:3.12-slim lacks -- the build failed outright;
+      (b) every compose command used `bash -lc`, and a LOGIN shell re-initialises
+          PATH from /etc/profile, discarding the venv -- so every swoosh-* command
+          was "not found" in the container. Fixed with an /etc/profile.d drop-in.
+- [x] Verified in-container end to end: campaign -> collect -> A -> B -> process ->
+      validate -> export, all four simulated cameras reconciling. Still to be run on
+      the LAB machine with real hardware.
+
 ### Still open from the review
-- [ ] Re-encode/summarise in a SUBPROCESS -- `summarize.py` loads whole videos into RAM
-      in-process (a 5-min episode is ~8 GB/camera) and contends for the GIL with the
-      control loop
-- [ ] Record a config/git/matrix/TCP-offset snapshot into run.json, and refuse to
-      collect without a recent `--verify-frame` result for the current matrix
-- [ ] Workspace box corners are not reachability-checked; target can run away while
-      the arm is frozen (re-anchor when tracking error persists)
-- [ ] Move gripper I/O off the control thread (modbus round trips are 5-15 ms)
-- [ ] `swoosh-validate`: per-run held-value fraction, rate histogram, commanded->measured
-      cross-correlation lag, camera/robot lag, frame-count reconciliation
-- [ ] Refuse to start an episode unless every expected camera is streaming
-- [ ] Export `episodes_stats` for action/state (LeRobot normalisation needs them)
-- [ ] Measure camera latency once and store it in meta
+- [x] Workspace box corners are reachability-checked

@@ -29,15 +29,19 @@ class Check:
 
 
 def run_checks(cfg: dict, arm: Any, pad: Any, want_cameras: bool,
-               inflight: set, last_state: Any = None) -> list[Check]:
+               inflight: set, last_state: Any = None,
+               simulate: bool = False) -> list[Check]:
     from .cameras import resolve_labelled
     from .provenance import frame_is_verified
 
     checks: list[Check] = []
 
-    ok, why = frame_is_verified()
-    checks.append(Check("45-degree frame verified against the arm", ok,
-                        why if not ok else why))
+    if simulate:
+        checks.append(Check("45-degree frame verified against the arm", True,
+                            "not applicable in simulation"))
+    else:
+        ok, why = frame_is_verified()
+        checks.append(Check("45-degree frame verified against the arm", ok, why))
 
     connected = bool(getattr(pad, "connected", False))
     checks.append(Check("Xbox pad connected", connected,

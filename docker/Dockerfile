@@ -14,7 +14,11 @@ ENV PYTHONUNBUFFERED=1 \
 # udev/libudev1 -> evdev enumerating /dev/input
 # git -> uv fetches the pinned xArm SDK from a git tag
 # xdg-utils -> the dashboard's "open folder" button
+# build-essential + linux-libc-dev -> the `evdev` wheel is built from source and needs
+#   a C compiler and <linux/input.h>; python:3.12-slim ships neither, and the build
+#   fails at `uv pip install` without them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential linux-libc-dev \
       ffmpeg git iproute2 libgl1 libglib2.0-0 libudev1 udev xdg-utils ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -27,4 +31,14 @@ COPY pyproject.toml uv.lock* README.md ./
 COPY src ./src
 RUN uv pip install --python /opt/venv/bin/python -e .
 
+# A LOGIN shell (bash -lc) re-initialises PATH from /etc/profile and throws away the
+# image's ENV PATH, which silently made every swoosh-* command "not found" inside the
+# container -- and exporting PATH from an entrypoint does not survive it either. A
+# profile.d drop-in is the one place a login shell will honour.
+RUN printf 'export PATH="/opt/venv/bin:$PATH"\nexport VIRTUAL_ENV=/opt/venv\n' \
+      > /etc/profile.d/10-venv.sh
+
+COPY docker/entrypoint.bash /entrypoint.bash
+RUN chmod +x /entrypoint.bash
+ENTRYPOINT ["/entrypoint.bash"]
 CMD ["bash"]

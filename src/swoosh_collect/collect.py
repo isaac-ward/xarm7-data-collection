@@ -100,6 +100,11 @@ def main() -> int:
     ap.add_argument("--no-cameras", action="store_true", help="teleop without recording video")
     ap.add_argument("--no-home", action="store_true", help="skip the initial re-home")
     ap.add_argument("--no-browser", action="store_true", help="don't auto-open a browser tab")
+    ap.add_argument("--simulate", action="store_true",
+                    help="run against SIMULATED hardware -- no arm, pad or cameras needed. "
+                         "Exercises the real control loop, recorder, dashboard and export.")
+    ap.add_argument("--idle-pad", action="store_true",
+                    help="with --simulate, hold the sticks at zero")
     ap.add_argument("--allow-unverified-frame", action="store_true",
                     help="collect even though the 45-degree frame is unverified (NOT advised)")
     args = ap.parse_args()
@@ -110,6 +115,8 @@ def main() -> int:
     # A wrong frame matrix mislabels every action in the campaign and is unrecoverable
     # afterwards, so refuse by default rather than discover it in training.
     ok_frame, why = frame_is_verified()
+    if args.simulate:
+        ok_frame, why = True, "simulation - frame verification not applicable"
     if not ok_frame and not args.allow_unverified_frame:
         print(f"[collect] REFUSING TO COLLECT: {why}", file=sys.stderr)
         print("[collect] override with --allow-unverified-frame if you really mean it.",
@@ -120,14 +127,20 @@ def main() -> int:
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
 
-    pad = XboxPad(cfg)
-    if not pad.start():
+    if args.simulate:
+        from .simhw import SimulatedArm, SimulatedCameraRig, SimulatedPad
+        pad = SimulatedPad(cfg, idle=args.idle_pad)
+        pad.start()
+        print("[collect] SIMULATED hardware -- no arm, pad or cameras", flush=True)
+    else:
+        pad = XboxPad(cfg)
+    if not args.simulate and not pad.start():
         print("No gamepad found. Plug in the wired Xbox pad and try again.", file=sys.stderr)
         print("  check: ls -l /dev/input/event*", file=sys.stderr)
         return 1
     print(f"[collect] pad: {pad._device.name}", flush=True)
 
-    arm = RightArm(cfg)
+    arm = SimulatedArm(cfg) if args.simulate else RightArm(cfg)
     print(f"[collect] connecting to right arm at {arm.ip} ...", flush=True)
     try:
         arm.connect()
@@ -162,9 +175,11 @@ def main() -> int:
     )
 
     live = LiveState()
+    live.preview = bool(args.simulate)     # the ticker says SIMULATED
     server = DashboardServer(
         cfg, campaign, live, port=int(get(cfg, "dashboard.port", 8770))
     )
+    server.arm_ref["arm"] = arm          # lets the sanity buttons talk to the arm
     url = server.start(open_browser=not args.no_browser)
     print(f"[collect] dashboard: {url}", flush=True)
     print("[collect] A start   B stop   Y re-home   Start quit", flush=True)
@@ -223,22 +238,27 @@ def main() -> int:
                             f"wait for it to finish before starting another run")
 
                 elif button == "start_episode" and rec is None:
+                    # Every episode is gated on the same cheap checks -- a one-shot
+                    # campaign cannot afford one recorded with three cameras or an
+                    # unverified frame. Printed with ticks/crosses; nothing starts if
+                    # any check fails.
+                    checks = run_checks(cfg, arm, pad,
+                                        not args.no_cameras and not args.simulate,
+                                        inflight, last_state, simulate=args.simulate)
+                    live.set_checks([{"name": c.name, "ok": c.ok, "detail": c.detail}
+                                     for c in checks])
+                    if not report(checks):
+                        hint = ("pre-run checks failed: "
+                                + next(c.name for c in checks if not c.ok))
+                        next_tick = time.monotonic()
+                        continue
                     # run.json is written immediately with status `recording`, so the
                     # dashboard lists the run the instant A is pressed.
-                    # Refuse to start rather than quietly record an episode with a
-                    # dead camera -- a 3-camera episode in a 4-camera dataset is worse
-                    # than no episode.
-                    if not args.no_cameras:
-                        try:
-                            from .cameras import resolve_labelled
-                            resolve_labelled(cfg)
-                        except Exception as exc:
-                            hint = f"cameras not ready: {exc}"
-                            continue
                     run_dir = campaign.new_run_dir()
                     rec = RunRecorder(run_dir, t0=t_loop0)
                     if not args.no_cameras:
-                        rig = CameraRig(cfg, run_dir / "video")
+                        rig = (SimulatedCameraRig if args.simulate else CameraRig)(
+                            cfg, run_dir / "video")
                         try:
                             # ONE CLOCK ORIGIN for every stream: t_loop0, not `now`.
                             # Passing the A-press time here gave cameras a different

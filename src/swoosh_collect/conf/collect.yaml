@@ -71,10 +71,15 @@ control:
   # The target is CLAMPED, not halted: pushing into a wall slides along it and motion
   # on the other axes continues. Editable live from the dashboard's 3D scene panel.
   workspace_box_mm:
-    x: [150.0, 700.0]            # forward
-    y: [-450.0, 450.0]           # left / right
-    z: [50.0, 800.0]             # up
-
+    x:
+    - 150.0
+    - 700.0
+    y:
+    - -450.0
+    - 450.0
+    z:
+    - 50.0
+    - 700.0
 controller:
   # Wired Xbox pad. Matched by device NAME, not a fixed /dev/input/eventN, because
   # the number moves between boots and replugs.
