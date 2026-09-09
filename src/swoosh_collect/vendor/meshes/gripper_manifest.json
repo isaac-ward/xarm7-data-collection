@@ -1,0 +1,678 @@
+{
+  "schema": "xarm7-gripper-meshes/1",
+  "source_mjcf": "pi05/out/menagerie/ufactory_xarm7/xarm7.xml",
+  "source_assets": "pi05/out/menagerie/ufactory_xarm7/assets",
+  "format": "binary STL (three.js STLLoader, r160)",
+  "units": "metres",
+  "length_scale_to_metres": 1.0,
+  "coordinate_frame": "Every mesh's vertices are already expressed in its own MJCF body frame. Build the sub-tree as nested three.js Groups using `position` + `quaternion_xyzw`, add the STL geometry to each group with NO extra local transform, and rotate the moving groups about `joint.axis` by theta.",
+  "root": {
+    "attach_to": "link7",
+    "mjcf_body": "xarm_gripper_base_link",
+    "position": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "quaternion_xyzw": [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    "note": "180 deg about link7's z; offset from link7's origin is exactly 0 m (flush)."
+  },
+  "tcp_site": {
+    "name": "link_tcp",
+    "parent": "xarm_gripper_base_link",
+    "position": [
+      0.0,
+      0.0,
+      0.172
+    ]
+  },
+  "gripper_norm": {
+    "convention": "0 = CLOSED, 1 = OPEN (observation.state dims 13 and 27; = xArm counts / 850)",
+    "theta_symbol": "theta",
+    "theta_units": "radians",
+    "theta_closed": 0.85,
+    "theta_open": 0.0,
+    "formula": "theta = 0.85 * (1.0 - g)",
+    "inverse": "g = 1.0 - theta / 0.85",
+    "drives": [
+      "left_driver_joint",
+      "left_finger_joint",
+      "left_inner_knuckle_joint",
+      "right_driver_joint",
+      "right_finger_joint",
+      "right_inner_knuckle_joint"
+    ],
+    "note": "All six joints take the same scalar theta; the per-joint `axis` sign gives each its direction.",
+    "finger_separation_m": {
+      "definition": "gap between the two fingers' inner faces (== gap between the pad_box grip surfaces)",
+      "formula": "sep(theta) = 2*(0.035 + 0.035465*cos(theta) - 0.042039*sin(theta)) - 0.052006",
+      "at_g_0_closed": 0.00164,
+      "at_g_0p5": 0.047947,
+      "at_g_1_open": 0.088924,
+      "exact_inverse_if_you_prefer_linear_in_millimetres": "theta = acos((0.5*sep + 0.026003 - 0.035)/0.055000) - 0.870017   (use sep = 0.001640 + g*(0.088924-0.001640) for a mapping that is linear in finger separation rather than linear in joint angle; the two differ by at most ~2.7 mm mid-stroke)"
+    }
+  },
+  "order": [
+    "xarm_gripper_base_link",
+    "left_outer_knuckle",
+    "left_finger",
+    "left_inner_knuckle",
+    "right_outer_knuckle",
+    "right_finger",
+    "right_inner_knuckle"
+  ],
+  "parts": {
+    "xarm_gripper_base_link": {
+      "mjcf_body": "xarm_gripper_base_link",
+      "parent": "link7",
+      "file": "base_link.stl",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "mesh_local_transform": "identity",
+      "material_hex": "#ffffff",
+      "mjcf_material": "white",
+      "triangles": 24227,
+      "vertices": 72681,
+      "unique_vertices": 14412,
+      "bbox_min_m": [
+        -0.0375,
+        -0.051069,
+        -0.009
+      ],
+      "bbox_max_m": [
+        0.0375,
+        0.051069,
+        0.103147
+      ],
+      "bytes": 1211434,
+      "moves_with_joint": false,
+      "joint": null,
+      "quaternion_xyzw_closed": [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ],
+      "quaternion_xyzw_open": [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    "left_outer_knuckle": {
+      "mjcf_body": "left_outer_knuckle",
+      "parent": "xarm_gripper_base_link",
+      "file": "left_outer_knuckle.stl",
+      "position": [
+        0.0,
+        0.035,
+        0.059098
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "mesh_local_transform": "identity",
+      "material_hex": "#262626",
+      "mjcf_material": "black",
+      "triangles": 444,
+      "vertices": 1332,
+      "unique_vertices": 218,
+      "bbox_min_m": [
+        -0.0059,
+        -0.025904,
+        -0.007669
+      ],
+      "bbox_max_m": [
+        0.0059,
+        0.051464,
+        0.048032
+      ],
+      "bytes": 22284,
+      "moves_with_joint": true,
+      "joint": {
+        "name": "left_driver_joint",
+        "type": "hinge",
+        "axis": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "pivot": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "range_rad": [
+          0.0,
+          0.85
+        ],
+        "angle": "theta",
+        "note": "rotate this body about `axis` (expressed in this body's own frame, pivot at the body origin) by +theta radians; the axis sign already encodes the direction, so every gripper body uses the SAME scalar theta"
+      },
+      "quaternion_xyzw_closed": [
+        0.41232078174342474,
+        0.0,
+        0.0,
+        0.9110387329540337
+      ],
+      "quaternion_xyzw_open": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "left_finger": {
+      "mjcf_body": "left_finger",
+      "parent": "left_outer_knuckle",
+      "file": "left_finger.stl",
+      "position": [
+        0.0,
+        0.035465,
+        0.042039
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "mesh_local_transform": "identity",
+      "material_hex": "#262626",
+      "mjcf_material": "black",
+      "triangles": 4852,
+      "vertices": 14556,
+      "unique_vertices": 2426,
+      "bbox_min_m": [
+        -0.016,
+        -0.026003,
+        -0.005926
+      ],
+      "bbox_max_m": [
+        0.016,
+        0.005926,
+        0.061003
+      ],
+      "bytes": 242684,
+      "moves_with_joint": true,
+      "joint": {
+        "name": "left_finger_joint",
+        "type": "hinge",
+        "axis": [
+          -1.0,
+          0.0,
+          0.0
+        ],
+        "pivot": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "range_rad": [
+          0.0,
+          0.85
+        ],
+        "angle": "theta",
+        "note": "rotate this body about `axis` (expressed in this body's own frame, pivot at the body origin) by +theta radians; the axis sign already encodes the direction, so every gripper body uses the SAME scalar theta"
+      },
+      "quaternion_xyzw_closed": [
+        -0.41232078174342474,
+        0.0,
+        0.0,
+        0.9110387329540337
+      ],
+      "quaternion_xyzw_open": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "left_inner_knuckle": {
+      "mjcf_body": "left_inner_knuckle",
+      "parent": "xarm_gripper_base_link",
+      "file": "left_inner_knuckle.stl",
+      "position": [
+        0.0,
+        0.02,
+        0.074098
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "mesh_local_transform": "identity",
+      "material_hex": "#262626",
+      "mjcf_material": "black",
+      "triangles": 7324,
+      "vertices": 21972,
+      "unique_vertices": 3656,
+      "bbox_min_m": [
+        -0.014068,
+        -0.005984,
+        -0.005984
+      ],
+      "bbox_max_m": [
+        0.014068,
+        0.041449,
+        0.048023
+      ],
+      "bytes": 366284,
+      "moves_with_joint": true,
+      "joint": {
+        "name": "left_inner_knuckle_joint",
+        "type": "hinge",
+        "axis": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "pivot": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "range_rad": [
+          0.0,
+          0.85
+        ],
+        "angle": "theta",
+        "note": "rotate this body about `axis` (expressed in this body's own frame, pivot at the body origin) by +theta radians; the axis sign already encodes the direction, so every gripper body uses the SAME scalar theta"
+      },
+      "quaternion_xyzw_closed": [
+        0.41232078174342474,
+        0.0,
+        0.0,
+        0.9110387329540337
+      ],
+      "quaternion_xyzw_open": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "right_outer_knuckle": {
+      "mjcf_body": "right_outer_knuckle",
+      "parent": "xarm_gripper_base_link",
+      "file": "right_outer_knuckle.stl",
+      "position": [
+        0.0,
+        -0.035,
+        0.059098
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "mesh_local_transform": "identity",
+      "material_hex": "#262626",
+      "mjcf_material": "black",
+      "triangles": 444,
+      "vertices": 1332,
+      "unique_vertices": 218,
+      "bbox_min_m": [
+        -0.0059,
+        -0.051464,
+        -0.007669
+      ],
+      "bbox_max_m": [
+        0.0059,
+        0.025904,
+        0.048032
+      ],
+      "bytes": 22284,
+      "moves_with_joint": true,
+      "joint": {
+        "name": "right_driver_joint",
+        "type": "hinge",
+        "axis": [
+          -1.0,
+          0.0,
+          0.0
+        ],
+        "pivot": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "range_rad": [
+          0.0,
+          0.85
+        ],
+        "angle": "theta",
+        "note": "rotate this body about `axis` (expressed in this body's own frame, pivot at the body origin) by +theta radians; the axis sign already encodes the direction, so every gripper body uses the SAME scalar theta"
+      },
+      "quaternion_xyzw_closed": [
+        -0.41232078174342474,
+        0.0,
+        0.0,
+        0.9110387329540337
+      ],
+      "quaternion_xyzw_open": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "right_finger": {
+      "mjcf_body": "right_finger",
+      "parent": "right_outer_knuckle",
+      "file": "right_finger.stl",
+      "position": [
+        0.0,
+        -0.035465,
+        0.042039
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "mesh_local_transform": "identity",
+      "material_hex": "#262626",
+      "mjcf_material": "black",
+      "triangles": 4852,
+      "vertices": 14556,
+      "unique_vertices": 2426,
+      "bbox_min_m": [
+        -0.016,
+        -0.005926,
+        -0.005926
+      ],
+      "bbox_max_m": [
+        0.016,
+        0.026003,
+        0.061003
+      ],
+      "bytes": 242684,
+      "moves_with_joint": true,
+      "joint": {
+        "name": "right_finger_joint",
+        "type": "hinge",
+        "axis": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "pivot": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "range_rad": [
+          0.0,
+          0.85
+        ],
+        "angle": "theta",
+        "note": "rotate this body about `axis` (expressed in this body's own frame, pivot at the body origin) by +theta radians; the axis sign already encodes the direction, so every gripper body uses the SAME scalar theta"
+      },
+      "quaternion_xyzw_closed": [
+        0.41232078174342474,
+        0.0,
+        0.0,
+        0.9110387329540337
+      ],
+      "quaternion_xyzw_open": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "right_inner_knuckle": {
+      "mjcf_body": "right_inner_knuckle",
+      "parent": "xarm_gripper_base_link",
+      "file": "right_inner_knuckle.stl",
+      "position": [
+        0.0,
+        -0.02,
+        0.074098
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "mesh_local_transform": "identity",
+      "material_hex": "#262626",
+      "mjcf_material": "black",
+      "triangles": 7324,
+      "vertices": 21972,
+      "unique_vertices": 3656,
+      "bbox_min_m": [
+        -0.014068,
+        -0.041449,
+        -0.005984
+      ],
+      "bbox_max_m": [
+        0.014068,
+        0.005984,
+        0.048023
+      ],
+      "bytes": 366284,
+      "moves_with_joint": true,
+      "joint": {
+        "name": "right_inner_knuckle_joint",
+        "type": "hinge",
+        "axis": [
+          -1.0,
+          0.0,
+          0.0
+        ],
+        "pivot": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "range_rad": [
+          0.0,
+          0.85
+        ],
+        "angle": "theta",
+        "note": "rotate this body about `axis` (expressed in this body's own frame, pivot at the body origin) by +theta radians; the axis sign already encodes the direction, so every gripper body uses the SAME scalar theta"
+      },
+      "quaternion_xyzw_closed": [
+        -0.41232078174342474,
+        0.0,
+        0.0,
+        0.9110387329540337
+      ],
+      "quaternion_xyzw_open": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  },
+  "pads": [
+    {
+      "name": "left_finger_pad_1",
+      "parent": "left_finger",
+      "type": "box",
+      "half_size_m": [
+        0.015,
+        0.002,
+        0.0095
+      ],
+      "position": [
+        0.0,
+        -0.024003,
+        0.032
+      ],
+      "quaternion_xyzw": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "rgba": [
+        0.0,
+        0.10000000149011612,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "name": "left_finger_pad_2",
+      "parent": "left_finger",
+      "type": "box",
+      "half_size_m": [
+        0.015,
+        0.002,
+        0.0095
+      ],
+      "position": [
+        0.0,
+        -0.024003,
+        0.05
+      ],
+      "quaternion_xyzw": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "rgba": [
+        0.0,
+        0.5,
+        0.5,
+        1.0
+      ]
+    },
+    {
+      "name": "right_finger_pad_1",
+      "parent": "right_finger",
+      "type": "box",
+      "half_size_m": [
+        0.015,
+        0.002,
+        0.0095
+      ],
+      "position": [
+        0.0,
+        0.024003,
+        0.032
+      ],
+      "quaternion_xyzw": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "rgba": [
+        0.0,
+        0.10000000149011612,
+        0.699999988079071,
+        1.0
+      ]
+    },
+    {
+      "name": "right_finger_pad_2",
+      "parent": "right_finger",
+      "type": "box",
+      "half_size_m": [
+        0.015,
+        0.002,
+        0.0095
+      ],
+      "position": [
+        0.0,
+        0.024003,
+        0.05
+      ],
+      "quaternion_xyzw": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "rgba": [
+        0.0,
+        0.5,
+        0.5,
+        1.0
+      ]
+    }
+  ],
+  "notes": [
+    "SOURCE: pi05/out/menagerie/ufactory_xarm7/xarm7.xml (the WITH-gripper model). hand.xml is the same subtree standalone.",
+    "IMPORTANT TRAP (identical to the arm links): MuJoCo's compiler recentres each mesh onto its inertial frame and stores the recovery in geom_pos/geom_quat, which compile to EXACTLY mesh_pos/mesh_quat (verified: |geom_pos-mesh_pos| = 0 and |geom_quat-mesh_quat| = 0 for all 7 gripper meshes). The raw STL attached at the BODY pose with an IDENTITY local transform is correct. Applying compiled geom_pos/geom_quat double-transforms and shifts parts by 5-37 mm.",
+    "Verified numerically at a random arm pose with theta=0.37: two-sided Hausdorff distance between (body xpos/xquat) x raw-STL and MuJoCo's own (geom_xpos/geom_xmat) x compiled mesh_vert is 2.71e-09 m worst case over the whole gripper subtree, i.e. float32 STL rounding.",
+    "Quaternions are xyzw (three.js). MuJoCo's native order is wxyz.",
+    "xarm_gripper_base_link is COINCIDENT with link7's origin (body pos 0 0 0) and rotated 180 deg about link7's z (MJCF quat wxyz 0 0 0 1 -> xyzw 0 0 1 0). The gripper base is flush on the end of link7; the offset is exactly zero.",
+    "THE LINKAGE IS AN EXACT PARALLELOGRAM. outer-knuckle pivot -> finger pivot = (0, 0.035465, 0.042039) and inner-knuckle pivot -> connect anchor = the same vector, so all six gripper joints take the SAME scalar theta and each finger TRANSLATES without rotating relative to the gripper base. Verified: the two `connect` equality residuals are 2.9e-17 m and the finger-vs-base relative rotation is 4e-06 deg at every theta in [0, 0.85].",
+    "Each joint's `axis` already carries the correct sign, so you drive every moving body with the same +theta. Pivot is the body origin (jnt_pos = 0 0 0) for all six.",
+    "theta = 0 is FULLY OPEN, theta = 0.85 rad is FULLY CLOSED. This is the opposite sense to our data channel, hence the (1 - g) in the mapping below.",
+    "The MuJoCo actuator confirms the extremes: tendon `split` has coef 0.5 on each driver joint so its length IS theta, and the affine actuator settles at length = 0.333*ctrl/100, i.e. ctrl 0 -> theta 0 and ctrl 255 -> theta 0.84915.",
+    "The real xArm gripper counts (0..850, 0 = closed) are the reverse of MuJoCo's ctrl (0..255, 0 = open). Do not carry the MuJoCo ctrl sense into the renderer.",
+    "For rendering, use only these 7 mesh parts. The 4 `pad_box` geoms under `pads` are collision-only (MJCF group 3) and sit exactly flush with the finger meshes' inner faces; include them only for debugging.",
+    "three.js is Y-up, this model is Z-up. Handle that once on the ROOT group, exactly as the arm links already do -- never per part."
+  ],
+  "totals": {
+    "triangles": 49467,
+    "vertices": 148401,
+    "bytes": 2473938
+  }
+}

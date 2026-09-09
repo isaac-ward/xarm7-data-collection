@@ -1,0 +1,134 @@
+# Swoosh RIGHT-ARM data collection. One file, every knob.
+#
+# Hardware facts below are carried over from sisl/manipulation-mono (full read
+# 2026-09-08) -- see README for what came from where.
+#
+# The dashboard edits `cameras.by_usb_path`, `control.workspace_box_mm` and
+# `recording.campaigns_dir` in place via config.set_value(), which round-trips
+# through ruamel so THESE COMMENTS SURVIVE. An earlier version re-dumped the whole
+# document with yaml.safe_dump and erased every one of them.
+
+arm:
+  # Right xArm controller. Left (.219) is deliberately absent: this project is
+  # right-arm only. Physical wiring: right controller -> router LAN slot 1.
+  ip: "192.168.1.199"
+  # Wired NIC on the lab laptop; the container assigns 192.168.1.100/24 to it so
+  # the OS can route to the arm subnet.
+  nic: "enp129s0"
+  host_ip_cidr: "192.168.1.100/24"
+
+  # 0 = OFF. manipulation-mono runs 0 because the controller's payload model does
+  # not know the gripper's mass, and even sensitivity 1 spuriously trips error 31
+  # ("Collision Caused Abnormal Current") and refuses to move. Set the real TCP
+  # load in xArm Studio and you can raise this back to 3.
+  # WITH THIS AT 0, REAL COLLISIONS ARE NOT CAUGHT. Clear the workspace.
+  collision_sensitivity: 0
+
+  # Right-arm home, degrees, 7 joints. From manipulation-mono's starting_poses.right.
+  # TCP lands around (330, 0, 621) mm so EE teleop has headroom in every direction.
+  # All-zeros is NOT safe -- J4=0 fully extends the elbow into the base.
+  home_joints: [4, -37, -3, 49, -7, 16, -40]
+  home_speed_deg_s: 20.0
+  home_acc_deg_s2: 100.0
+
+  # set_servo_cartesian shaping. The controller picks its own internal interpolation
+  # at streaming rate, but these are passed to avoid surprises.
+  speed_mm_s: 200.0
+  acc_mm_s2: 2000.0
+
+gripper:
+  # Standard xArm gripper travel -- the same gripper as manipulation-mono (confirmed
+  # by Isaac 2026-09-09). Proportional: trigger 0..1 maps linearly onto open..closed.
+  # manipulation-mono used a binary threshold and noted the analog value "didn't move
+  # the gripper smoothly in practice"; we are deliberately trying proportional and
+  # logging the raw trigger either way, so that stays revisitable from recorded data
+  # rather than by re-collecting.
+  open_position: 850
+  closed_position: 0
+  speed: 2000
+  # Don't resend a position closer than this to the last one. The gripper is a slow
+  # modbus device and flooding it backs its worker queue up.
+  min_command_delta: 15
+
+control:
+  rate_hz: 100.0                 # xArm's recommended set_servo_cartesian rate
+
+  # Sticks MODIFY the desired pose; releasing a stick leaves the target where it is
+  # (it does not spring back).   target += stick * rate * dt
+  translation_rate_mm_s: 120.0   # full stick deflection -> mm/s
+  yaw_rate_deg_s: 60.0           # full right-stick-X deflection -> deg/s about world Z
+  deadzone: 0.12                 # fraction of full scale ignored around centre
+  expo: 2.0                      # 1.0 = linear; >1 gives finer control near centre
+
+  # If the measured pose falls this far behind the target for this long, re-anchor the
+  # target to where the arm actually is. Without it an unreachable target or a latched
+  # error lets the target integrate away while the arm sits still, recording actions
+  # that did nothing.
+  reanchor_mm: 30.0
+  reanchor_after_s: 0.2
+
+  # Workspace clamp, WORLD frame, millimetres, relative to the arm base origin.
+  # The target is CLAMPED, not halted: pushing into a wall slides along it and motion
+  # on the other axes continues. Editable live from the dashboard's 3D scene panel.
+  workspace_box_mm:
+    x: [150.0, 700.0]            # forward
+    y: [-450.0, 450.0]           # left / right
+    z: [50.0, 800.0]             # up
+
+controller:
+  # Wired Xbox pad. Matched by device NAME, not a fixed /dev/input/eventN, because
+  # the number moves between boots and replugs.
+  name_match: "Xbox"
+  buttons:
+    start_episode: "BTN_SOUTH"   # A
+    stop_episode: "BTN_EAST"     # B
+    # EVDEV NAMING TRAP: BTN_NORTH is the physical X (0x133); BTN_WEST is the
+    # physical Y (0x134). Binding rehome to BTN_NORTH put it on X -- the button
+    # meant to stay unbound. Verified against evdev 2.0.0 on this machine.
+    rehome: "BTN_WEST"           # Y, behind the motion countdown
+    quit: "BTN_START"            # Start -> clean shutdown, arm holds position
+  axes:
+    move_x: "ABS_Y"              # left stick vertical    -> world +X forward
+    move_y: "ABS_X"              # left stick horizontal  -> world +Y left
+    height: "ABS_RY"             # right stick vertical   -> world +Z up
+    yaw: "ABS_RX"                # right stick horizontal -> yaw about world Z
+    gripper: "ABS_RZ"            # right trigger          -> gripper closure
+  # evdev reports sticks with +Y downward, so these flip them into the world frame.
+  invert:
+    move_x: true
+    move_y: true
+    height: true
+    yaw: false
+
+cameras:
+  # Discovered from /sys/class/video4linux/*/name, one entry per physical USB device.
+  name_filter: "Arducam"
+  fps: 30.0                      # MJPG sustains 30+; YUYV would cap at 5-10
+  width: 640
+  height: 480
+  fourcc: "MJPG"
+  warmup_frames: 25
+  # Seconds between consecutive VIDIOC_STREAMONs so four cameras don't saturate one
+  # USB hub at once. Runs on a WORKER, never in the control loop -- it used to stall
+  # the servo for ~1 s at every A press.
+  open_stagger_sec: 0.25
+  mp4_quality: 8
+  # Label <-> USB port path, written by the dashboard's "name cameras" button. Pinned
+  # by PATH so labels survive reboots and replugs; enumeration order does not.
+  by_usb_path: {}
+  # The four we expect. This order is the order they appear in the summary MP4 grid.
+  expected_labels: ["scene_left", "scene_right", "gripper_right_bottom", "gripper_right_top"]
+
+recording:
+  # Raw streams are the authoritative record: every stream at its own native rate on
+  # ONE monotonic clock. The 30 Hz LeRobot export is DERIVED from them, so a wrong
+  # sync or action decision is fixable later without re-collecting.
+  export_rate_hz: 30.0
+  # Where campaigns are written. A relative path resolves against the repo root; an
+  # absolute path (an external drive, say) is used as-is. Set it from the dashboard's
+  # "choose root folder" button.
+  campaigns_dir: "campaigns"
+
+dashboard:
+  refresh_hz: 15.0
+  port: 8770

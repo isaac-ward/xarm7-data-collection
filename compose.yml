@@ -1,0 +1,64 @@
+name: swoosh-collect
+
+# One service. `docker compose run --rm collect` is the whole workflow.
+#
+#   network_mode host  -> the dashboard is reachable at 127.0.0.1 on the host, and the
+#                         container can talk to the arm subnet directly
+#   NET_ADMIN          -> lets the container assign 192.168.1.100/24 to the wired NIC
+#                         itself, so no sudo is needed in your shell (the docker daemon
+#                         is already root). Idempotent: skipped if already present.
+#   /dev + video group -> Arducams (major 81) and the Xbox pad (/dev/input)
+x-base: &base
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  image: swoosh-collect:latest
+  volumes:
+    - ./:/workspace
+  working_dir: /workspace
+  environment:
+    PYTHONUNBUFFERED: "1"
+    DISPLAY: "${DISPLAY:-:0}"
+  network_mode: host
+  cap_add: [NET_ADMIN]
+  group_add: ["video", "input"]
+  device_cgroup_rules:
+    - "c 81:* rmw"    # V4L2 video devices
+    - "c 13:* rmw"    # /dev/input event devices
+  devices:
+    - /dev/bus/usb:/dev/bus/usb
+  volumes_from: []
+  stdin_open: true
+  tty: true
+
+services:
+  collect:
+    <<: *base
+    volumes:
+      - ./:/workspace
+      - /dev:/dev
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    command: >
+      bash -lc "
+      ip -4 -brief addr show ${SWOOSH_NIC:-enp129s0} | grep -q '192.168.1.100/'
+        || ip addr add 192.168.1.100/24 dev ${SWOOSH_NIC:-enp129s0};
+      swoosh-collect --campaign \"$${CAMPAIGN:?set CAMPAIGN=<name>}\" $${COLLECT_ARGS:-}"
+
+  sanity:
+    <<: *base
+    volumes: [./:/workspace, /dev:/dev]
+    command: >
+      bash -lc "
+      ip -4 -brief addr show ${SWOOSH_NIC:-enp129s0} | grep -q '192.168.1.100/'
+        || ip addr add 192.168.1.100/24 dev ${SWOOSH_NIC:-enp129s0};
+      swoosh-sanity $${SANITY_ARGS:-}"
+
+  cameras:
+    <<: *base
+    volumes: [./:/workspace, /dev:/dev, /tmp/.X11-unix:/tmp/.X11-unix:rw]
+    command: bash -lc "swoosh-cameras $${CAMERA_ARGS:---assign}"
+
+  shell:
+    <<: *base
+    volumes: [./:/workspace, /dev:/dev]
+    command: bash

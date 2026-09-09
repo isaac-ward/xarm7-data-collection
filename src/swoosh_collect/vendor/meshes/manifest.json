@@ -1,0 +1,380 @@
+{
+  "schema": "xarm7-link-meshes/1",
+  "source_mjcf": "pi05/out/menagerie/ufactory_xarm7/xarm7_nohand.xml",
+  "source_assets": "pi05/out/menagerie/ufactory_xarm7/assets",
+  "format": "binary STL (three.js STLLoader, r160)",
+  "units": "metres",
+  "length_scale_to_metres": 1.0,
+  "coordinate_frame": "Each mesh's vertices are already expressed in its MJCF body frame. Attach the loaded geometry to a group whose position/quaternion you set from MuJoCo FK body xpos/xquat, and apply NO extra local transform.",
+  "notes": [
+    "The MJCF geoms carry NO explicit pos/quat and NO meshscale; compiler is angle='radian' meshdir='assets'.",
+    "IMPORTANT TRAP: MuJoCo's compiler recentres every mesh onto its inertial frame and stores the recovery transform in geom_pos/geom_quat, which compile to exactly mesh_pos/mesh_quat. Reading geom_pos/geom_quat out of the compiled MjModel and applying it to these raw STL files DOUBLE-APPLIES that transform and scrambles the arm. The correct local transform for these files is identity.",
+    "Verified numerically: for a random joint configuration, world vertices from (body xpos/xquat) x (raw STL verts) match MuJoCo's own (geom_xpos/geom_xmat) x (compiled mesh_vert) to 7.4e-09 m, i.e. float32 STL rounding.",
+    "Quaternions here are xyzw for three.js; MuJoCo's native order is wxyz.",
+    "three.js is Y-up by default while this model is Z-up. Either set camera.up=(0,0,1) or rotate the whole robot root group by -90 deg about X; do it on the ROOT, never per link.",
+    "The MJCF stands link_base on a 0.12 m pedestal (link_base pos='0 0 .12'). pi05/viz/fk.py subtracts that (MJCF_BASE_Z) to report FK in the xArm controller's flange frame. Whichever frame you draw in, use it for the base mesh too.",
+    "link7's visual geom is end_tool.stl, not link7.stl. link7.stl is declared in the <asset> block of both xarm7.xml and xarm7_nohand.xml but is referenced by no geom, so it is not shipped.",
+    "xarm7_nohand.xml has no gripper. Gripper meshes (base_link, left/right_finger, left/right_inner_knuckle, left/right_outer_knuckle) live in xarm7.xml and are not shipped here."
+  ],
+  "links": {
+    "base": {
+      "link_index": null,
+      "mjcf_body": "link_base",
+      "file": "link_base.stl",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "identity_transform": true,
+      "material_hex": "#ffffff",
+      "mjcf_material": "white",
+      "triangles": 6094,
+      "vertices": 18282,
+      "unique_vertices": 3021,
+      "bbox_min_m": [
+        -0.09231,
+        -0.063,
+        -0.0
+      ],
+      "bbox_max_m": [
+        0.062929,
+        0.063,
+        0.1548
+      ],
+      "bbox_size_m": [
+        0.155238,
+        0.126,
+        0.1548
+      ],
+      "bytes": 304784
+    },
+    "link1": {
+      "link_index": 1,
+      "mjcf_body": "link1",
+      "file": "link1.stl",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "identity_transform": true,
+      "material_hex": "#ffffff",
+      "mjcf_material": "white",
+      "triangles": 3682,
+      "vertices": 11046,
+      "unique_vertices": 1843,
+      "bbox_min_m": [
+        -0.048488,
+        -0.056552,
+        -0.112
+      ],
+      "bbox_max_m": [
+        0.048369,
+        0.075295,
+        0.048089
+      ],
+      "bbox_size_m": [
+        0.096858,
+        0.131847,
+        0.160089
+      ],
+      "bytes": 184184
+    },
+    "link2": {
+      "link_index": 2,
+      "mjcf_body": "link2",
+      "file": "link2.stl",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "identity_transform": true,
+      "material_hex": "#ffffff",
+      "mjcf_material": "white",
+      "triangles": 4510,
+      "vertices": 13530,
+      "unique_vertices": 2257,
+      "bbox_min_m": [
+        -0.047583,
+        -0.19178,
+        -0.042243
+      ],
+      "bbox_max_m": [
+        0.047425,
+        0.047364,
+        0.119007
+      ],
+      "bbox_size_m": [
+        0.095008,
+        0.239143,
+        0.161251
+      ],
+      "bytes": 225584
+    },
+    "link3": {
+      "link_index": 3,
+      "mjcf_body": "link3",
+      "file": "link3.stl",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "identity_transform": true,
+      "material_hex": "#ffffff",
+      "mjcf_material": "white",
+      "triangles": 4740,
+      "vertices": 14220,
+      "unique_vertices": 2372,
+      "bbox_min_m": [
+        -0.042414,
+        -0.067195,
+        -0.101101
+      ],
+      "bbox_max_m": [
+        0.094854,
+        0.069091,
+        0.042768
+      ],
+      "bbox_size_m": [
+        0.137268,
+        0.136286,
+        0.14387
+      ],
+      "bytes": 237084
+    },
+    "link4": {
+      "link_index": 4,
+      "mjcf_body": "link4",
+      "file": "link4.stl",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "identity_transform": true,
+      "material_hex": "#ffffff",
+      "mjcf_material": "white",
+      "triangles": 4872,
+      "vertices": 14616,
+      "unique_vertices": 2438,
+      "bbox_min_m": [
+        -0.04273,
+        -0.169175,
+        -0.042496
+      ],
+      "bbox_max_m": [
+        0.12026,
+        0.04271,
+        0.10691
+      ],
+      "bbox_size_m": [
+        0.16299,
+        0.211885,
+        0.149406
+      ],
+      "bytes": 243684
+    },
+    "link5": {
+      "link_index": 5,
+      "mjcf_body": "link5",
+      "file": "link5.stl",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "identity_transform": true,
+      "material_hex": "#ffffff",
+      "mjcf_material": "white",
+      "triangles": 4580,
+      "vertices": 13740,
+      "unique_vertices": 2292,
+      "bbox_min_m": [
+        -0.042405,
+        -0.042553,
+        -0.173
+      ],
+      "bbox_max_m": [
+        0.042447,
+        0.086432,
+        0.037495
+      ],
+      "bbox_size_m": [
+        0.084852,
+        0.128985,
+        0.210495
+      ],
+      "bytes": 229084
+    },
+    "link6": {
+      "link_index": 6,
+      "mjcf_body": "link6",
+      "file": "link6.stl",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "identity_transform": true,
+      "material_hex": "#ffffff",
+      "mjcf_material": "white",
+      "triangles": 7986,
+      "vertices": 23958,
+      "unique_vertices": 3998,
+      "bbox_min_m": [
+        -0.037494,
+        -0.037503,
+        -0.03748
+      ],
+      "bbox_max_m": [
+        0.113492,
+        0.06852,
+        0.057888
+      ],
+      "bbox_size_m": [
+        0.150986,
+        0.106023,
+        0.095368
+      ],
+      "bytes": 399384
+    },
+    "link7": {
+      "link_index": 7,
+      "mjcf_body": "link7",
+      "file": "end_tool.stl",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "identity_transform": true,
+      "material_hex": "#c0c0c0",
+      "mjcf_material": "gray",
+      "triangles": 260,
+      "vertices": 780,
+      "unique_vertices": 132,
+      "bbox_min_m": [
+        -0.037595,
+        -0.052,
+        -0.027
+      ],
+      "bbox_max_m": [
+        0.037731,
+        0.037697,
+        0.0
+      ],
+      "bbox_size_m": [
+        0.075326,
+        0.089697,
+        0.027
+      ],
+      "bytes": 13084
+    }
+  },
+  "order": [
+    "base",
+    "link1",
+    "link2",
+    "link3",
+    "link4",
+    "link5",
+    "link6",
+    "link7"
+  ],
+  "totals": {
+    "triangles": 36724,
+    "vertices": 110172,
+    "bytes": 1836872
+  }
+}
