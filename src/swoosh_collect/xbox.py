@@ -31,6 +31,13 @@ class PadSnapshot:
     gripper: float = 0.0     # 0 open .. 1 closed
     connected: bool = False
     raw: dict[str, float] = field(default_factory=dict)   # every axis, pre-shaping
+    # axis -> AGE IN SECONDS of that axis's current value at snapshot time. Stored as
+    # an age, not a timestamp: the kernel's stamps are absolute CLOCK_MONOTONIC while
+    # every `t` in this project is relative to t_loop0, and mixing the two produced
+    # nonsense. An age is meaningful without knowing either epoch.
+    raw_age_s: dict[str, float] = field(default_factory=dict)
+    # oldest age across the axes that actually drive the arm, in seconds
+    input_age_s: float = float("nan")
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -42,6 +49,8 @@ class PadSnapshot:
             "gripper": self.gripper,
             "connected": self.connected,
             "raw": self.raw,
+            "raw_age_s": self.raw_age_s,
+            "input_age_s": self.input_age_s,
         }
 
 
@@ -53,6 +62,28 @@ def _shape(value: float, deadzone: float, expo: float) -> float:
         return 0.0
     scaled = (a - deadzone) / (1.0 - deadzone)
     return (1.0 if value > 0 else -1.0) * (scaled ** float(expo))
+
+
+def _ages(now_abs: float, raw_t: dict) -> dict:
+    """Per-axis age in seconds, from absolute kernel stamps."""
+    import math
+
+    return {k: round(now_abs - v, 6)
+            for k, v in raw_t.items() if not math.isnan(v)}
+
+
+def _oldest_age(now_abs: float, raw_t: dict, codes: list) -> float:
+    """Oldest age in seconds among the named axes' kernel event times.
+
+    `now_abs` MUST be absolute time.monotonic(), not the loop-relative `t` the rest of
+    the recorder uses -- the kernel's stamps are absolute, and subtracting one from the
+    other gave ages of -12300553 ms, i.e. the epoch gap rather than any latency.
+    """
+    import math
+
+    ages = [now_abs - raw_t[c] for c in codes
+            if c and c in raw_t and not math.isnan(raw_t[c])]
+    return max(ages) if ages else float("nan")
 
 
 class XboxPad:
@@ -69,6 +100,10 @@ class XboxPad:
         self._raw: dict[str, float] = {}       # ecode name -> normalised value
         self._absinfo: dict[str, tuple[float, float]] = {}
         self._events: list[tuple[float, str]] = []   # (t, logical button name)
+        self._raw_t: dict[str, float] = {}   # axis -> kernel event time
+        self.event_clock_monotonic = False
+        # (t, ecode name, logical or None) -- every press, for logging only
+        self._presses: list[tuple[float, str, str | None]] = []
         self._device: Any = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -95,6 +130,25 @@ class XboxPad:
                     return dev
         return None
 
+    def _use_monotonic_clock(self, dev: Any) -> bool:
+        """Ask the kernel to stamp this device's events on CLOCK_MONOTONIC.
+
+        By default evdev events carry CLOCK_REALTIME, which is not comparable to the
+        time.monotonic() clock every other stream in this project uses -- so the pad's
+        own event time was unusable and got discarded, leaving the action stamped with
+        the loop tick and up to ~18 ms of unmeasured staleness. EVIOCSCLOCKID switches
+        the device to the monotonic clock, after which event.timestamp() can be
+        subtracted from our own t directly.
+        """
+        import fcntl
+        import struct
+        EVIOCSCLOCKID = (1 << 30) | (4 << 16) | (0x45 << 8) | 0xA0   # _IOW('E',0xa0,int)
+        try:
+            fcntl.ioctl(dev.fd, EVIOCSCLOCKID, struct.pack("i", 1))  # 1 = CLOCK_MONOTONIC
+            return True
+        except OSError:
+            return False
+
     def start(self) -> bool:
         import evdev
 
@@ -102,6 +156,7 @@ class XboxPad:
         if dev is None:
             return False
         self._device = dev
+        self.event_clock_monotonic = self._use_monotonic_clock(dev)
         for code, info in dev.capabilities().get(evdev.ecodes.EV_ABS, []):
             name = evdev.ecodes.ABS[code]
             if isinstance(name, list):
@@ -138,6 +193,13 @@ class XboxPad:
                         val = 2.0 * (float(event.value) - lo) / span - 1.0
                     with self._lock:
                         self._raw[name] = val
+                        # The kernel's own stamp for THIS value. Comparable to
+                        # time.monotonic() once EVIOCSCLOCKID has been set; NaN if the
+                        # kernel refused, so a consumer can tell the difference rather
+                        # than silently trusting a realtime clock.
+                        self._raw_t[name] = (
+                            float(event.timestamp())
+                            if self.event_clock_monotonic else float("nan"))
                 elif event.type == evdev.ecodes.EV_KEY and event.value == 1:
                     names = evdev.ecodes.BTN.get(event.code) or evdev.ecodes.KEY.get(event.code)
                     # evdev returns a TUPLE of aliases for buttons that have several
@@ -150,12 +212,22 @@ class XboxPad:
                         candidates = [names]
                     else:
                         candidates = []
+                    logical = None
                     for ec in candidates:
                         logical = self._button_by_ecode.get(ec)
                         if logical:
                             with self._lock:
                                 self._events.append((now, logical))
                             break
+                    # Every press is also reported for LOGGING, mapped or not. An
+                    # unbound button used to produce nothing at all, so an operator
+                    # pressing the wrong one got silence and no way to tell that from
+                    # a dead pad. This queue never drives the arm.
+                    with self._lock:
+                        self._presses.append(
+                            (now, candidates[0] if candidates else f"code_{event.code}",
+                             logical)
+                        )
         except OSError:
             # Pad unplugged. Mark disconnected; the control loop keeps the arm still.
             self.connected = False
@@ -164,6 +236,7 @@ class XboxPad:
     def snapshot(self, t: float) -> PadSnapshot:
         with self._lock:
             raw = dict(self._raw)
+            raw_t = dict(self._raw_t)
         def axis(logical: str) -> float:
             ec = self.axis_map.get(logical)
             v = raw.get(ec, 0.0) if ec else 0.0
@@ -175,7 +248,8 @@ class XboxPad:
             # The pad went away. Return neutral rather than the last values it sent --
             # otherwise the arm keeps driving on a stale deflection and the recorded
             # action says the operator was holding the stick when they were not.
-            return PadSnapshot(t=t, connected=False, raw=raw)
+            return PadSnapshot(t=t, connected=False, raw=raw,
+                               raw_age_s=_ages(time.monotonic(), raw_t))
 
         return PadSnapshot(
             t=t,
@@ -191,7 +265,24 @@ class XboxPad:
             gripper=(lambda g: 0.0 if g < 0.03 else g)(max(0.0, min(1.0, axis("gripper")))),
             connected=self.connected,
             raw=raw,
+            raw_age_s=_ages(time.monotonic(), raw_t),
+            # How stale the driving axes are, measured rather than assumed. The five
+            # axes that move the arm; NaN if the kernel would not give us its clock.
+            input_age_s=_oldest_age(time.monotonic(), raw_t, [
+                self.axis_map.get(k) for k in
+                ("move_x", "move_y", "height", "yaw", "gripper")]),
         )
+
+    def drain_presses(self) -> list[tuple[float, str, str | None]]:
+        """Pop every button press since the last call, as (t, ecode_name, logical).
+
+        `logical` is None for a button with no binding. Logging only -- the control
+        loop drives off drain_events().
+        """
+        with self._lock:
+            out = self._presses
+            self._presses = []
+        return out
 
     def drain_events(self) -> list[tuple[float, str]]:
         """Pop all button presses since the last call. Edge-triggered, so one physical

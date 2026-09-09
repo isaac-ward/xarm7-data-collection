@@ -103,6 +103,18 @@ def resolve_labelled(cfg: dict[str, Any]) -> list[dict[str, Any]]:
             f"  configured ports:  {sorted(mapping)}\n"
             "Re-seat the cable or re-run: swoosh-cameras --assign"
         )
+    # Two ports mapped to one label would start two capture threads writing the same
+    # mp4 and the same *_frame_times.json -- interleaved frames from two physical
+    # cameras under one name, which is unrecoverable after the fact.
+    seen: dict[str, str] = {}
+    for c in out:
+        if c["label"] in seen:
+            raise RuntimeError(
+                f"label {c['label']!r} is mapped to two USB ports "
+                f"({seen[c['label']]} and {c['usb_port']}). Both would write the same "
+                f"mp4. Fix cameras.by_usb_path -- run: swoosh-cameras --assign"
+            )
+        seen[c["label"]] = c["usb_port"]
     order = list(get(cfg, "cameras.expected_labels", []) or [])
     out.sort(key=lambda c: order.index(c["label"]) if c["label"] in order else 99)
     return out
@@ -118,7 +130,27 @@ class CameraCapture:
     cfg: dict[str, Any]
     out_dir: Path
     stop_event: threading.Event
+    # False = preview only: publish frames for the dashboard, write no mp4 and record
+    # no timestamps. Lets the operator SEE the cameras before pressing A, which
+    # previously was impossible because the rig only existed during a recording.
+    record: bool = True
+    # Flip vertically the instant the frame leaves the device, before latest/mp4/
+    # timestamps -- so the preview, the recording and the export are all the same
+    # single orientation and nothing downstream has to compensate.
+    flip_vertical: bool = False
     latest: Any = None
+    # A read failure used to `break` with nothing set, so a camera dying mid-run was
+    # indistinguishable from a clean stop. The exporter then truncated the episode to
+    # the death time and still reported success.
+    stopped_early: bool = False
+    stopped_at_s: float = -1.0
+    frames_seen: int = 0        # read off the device, whether or not we are recording
+    # "v4l2_buffer" (kernel capture time) or "post_read" (when read() returned).
+    timestamp_source: str = "post_read"
+    # median(post_read - kernel) in seconds: the exposure + transfer + decode bias that
+    # post_read stamping silently carries.
+    read_lag_s: float = -1.0
+    _lags: list = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     timestamps: list[float] = field(default_factory=list)
     frames_written: int = 0
@@ -161,14 +193,22 @@ class CameraCapture:
         # Depth-1 queue: with the default 4-deep V4L2 queue a stalled encoder lets
         # frames pile up and the timestamp we take after read() lags by up to 4 frames
         # (133 ms) with nothing recording that it happened.
+        buf_ok = False
         try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            buf_ok = bool(cap.set(cv2.CAP_PROP_BUFFERSIZE, 1))
         except Exception:
             pass
+        fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
         self.actual = {
             "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
             "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
             "fps": float(cap.get(cv2.CAP_PROP_FPS)),
+            # The buffersize request's result was previously discarded. If the driver
+            # ignored it the V4L2 queue stays 4 deep and every frame we stamp is up to
+            # 4 frame periods (~133 ms) stale -- so whether it took has to be on record.
+            "buffersize_set": buf_ok,
+            "buffersize": int(cap.get(cv2.CAP_PROP_BUFFERSIZE)),
+            "fourcc": "".join(chr((fourcc_int >> (8 * i)) & 0xFF) for i in range(4)),
         }
 
         writer = None
@@ -179,28 +219,81 @@ class CameraCapture:
                 if not cap.read()[0]:
                     self.error = "warmup read failed"
                     return
-            path = self.out_dir / f"{self.label}.mp4"
-            writer = imageio.get_writer(
-                str(path),
-                fps=float(get(c, "cameras.fps", 30.0)),
-                codec="libx264",
-                quality=int(get(c, "cameras.mp4_quality", 8)),
-                macro_block_size=1,
-            )
+            if self.record:
+                path = self.out_dir / f"{self.label}.mp4"
+                writer = imageio.get_writer(
+                    str(path),
+                    fps=float(get(c, "cameras.fps", 30.0)),
+                    codec="libx264",
+                    quality=int(get(c, "cameras.mp4_quality", 8)),
+                    macro_block_size=1,
+                )
             while not self.stop_event.is_set():
                 ok, frame = cap.read()
+                if ok and frame is not None and self.flip_vertical:
+                    # -1 = BOTH axes = a 180 degree ROTATION, which is what an
+                    # upside-down mount actually is.
+                    # This was cv2.flip(frame, 0), a vertical MIRROR. That corrects
+                    # up/down but reverses chirality: the recorded view disagreed with
+                    # the other three cameras, and with move_y, about which way is
+                    # left. Two cameras on a vertical baseline cannot disagree on
+                    # azimuth, which is how it was caught -- the block stack sat
+                    # right-of-centre in one gripper view and left-of-centre in the
+                    # other.
+                    frame = cv2.flip(frame, -1)
                 if not ok or frame is None:
+                    # Not a normal exit: stop_event is how a run ends. Getting here
+                    # means the device went away (USB re-enumeration is the usual
+                    # cause on this hub) or the driver failed a read.
+                    self.stopped_early = True
+                    self.stopped_at_s = (
+                        self.timestamps[-1] if self.timestamps else 0.0)
+                    self.error = self.error or (
+                        f"read failed after {self.frames_written} frames "
+                        f"at t={self.stopped_at_s:.2f}s -- camera stopped early")
                     break
                 now = time.monotonic()
+                # V4L2 stamps each buffer on CLOCK_MONOTONIC -- the same clock as
+                # time.monotonic() -- at capture, before transfer and MJPG decode.
+                # Stamping after read() folds all of that in as a bias. Use the kernel
+                # value when it is sane, and record the measured difference either way.
+                cap_t = now
+                try:
+                    pos_ms = float(cap.get(cv2.CAP_PROP_POS_MSEC))
+                except Exception:
+                    pos_ms = 0.0
+                if pos_ms > 0.0:
+                    kt = pos_ms / 1000.0
+                    lag = now - kt
+                    # Sane means: same epoch as our clock, and the kernel time is not
+                    # in the future. A backend reporting a stream-relative position
+                    # fails this and we keep post_read stamping.
+                    if 0.0 <= lag < 0.5:
+                        cap_t = kt
+                        self.timestamp_source = "v4l2_buffer"
+                        if len(self._lags) < 900:
+                            self._lags.append(lag)
+                            self.read_lag_s = float(sorted(self._lags)[len(self._lags) // 2])
                 with self.lock:
                     self.latest = frame
+                self.frames_seen += 1        # counted in preview too, unlike
+                #                              frames_written, so camera health is
+                #                              observable before a run starts
+                if writer is None:
+                    continue    # preview: nothing is written and nothing is stamped
                 # Append the timestamp only AFTER the write succeeds, so a failed
                 # encode can never leave len(timestamps) != frames_written.
                 writer.append_data(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                self.timestamps.append(now - self._t0)
+                self.timestamps.append(cap_t - self._t0)
                 self.frames_written += 1
         except Exception as exc:
+            # A thread dying by exception (writer/pipe failure) is just as much an
+            # early stop as a failed read. The first version of this guard only set
+            # stopped_early on the read path, so an exception still produced a
+            # silently truncated episode that export accepted and validate passed.
             self.error = f"{type(exc).__name__}: {exc}"
+            self.stopped_early = True
+            self.stopped_at_s = self.timestamps[-1] if self.timestamps else 0.0
         finally:
             if writer is not None:
                 try:
@@ -224,9 +317,10 @@ def _count_frames(path: Path) -> int:
 class CameraRig:
     """All four cameras as one unit, sharing a clock origin and a stop event."""
 
-    def __init__(self, cfg: dict[str, Any], out_dir: Path) -> None:
+    def __init__(self, cfg: dict[str, Any], out_dir: Path, record: bool = True) -> None:
         self.cfg = cfg
         self.out_dir = out_dir
+        self.record = record
         self.stop_event = threading.Event()
         self.caps: list[CameraCapture] = []
 
@@ -245,9 +339,16 @@ class CameraRig:
             for cam in cams:
                 if self.stop_event.is_set():
                     return
+                # Keyed by USB PORT deliberately: a flip corrects how the camera is
+                # BOLTED ON, so it must survive relabelling. Keying it by label meant
+                # swapping two labels silently un-flipped one view and flipped the
+                # other. Labels are still accepted so old configs keep working.
+                _flip_cfg = set(get(self.cfg, "cameras.flip_vertical", []) or [])
+                flip = (cam["usb_port"] in _flip_cfg) or (cam["label"] in _flip_cfg)
                 cc = CameraCapture(
                     label=cam["label"], device=cam["device"], cfg=self.cfg,
                     out_dir=self.out_dir, stop_event=self.stop_event,
+                    record=self.record, flip_vertical=flip,
                 )
                 self.caps.append(cc)
                 cc.start(t0)
@@ -275,6 +376,12 @@ class CameraRig:
                         "frames": c.frames_written,
                         "measured_fps": round(c.fps, 3),
                         "error": c.error,
+                        "stopped_early": c.stopped_early,
+                        "stopped_at_s": round(c.stopped_at_s, 3),
+                        "timestamp_source": c.timestamp_source,
+                        "read_lag_s": round(c.read_lag_s, 4),
+                        # the frames in this mp4 are already flipped; do not flip again
+                        "flipped_vertical": c.flip_vertical,
                         "actual": c.actual,
                         # Decoded afterwards and compared: a single dropped frame would
                         # shift every later timestamp by one frame period in the export.
@@ -285,10 +392,27 @@ class CameraRig:
                 )
             )
 
+    def expected_missing(self) -> list[str]:
+        """Configured labels that produced no capture thread at all.
+
+        `start()` builds threads on a worker, so a device that could not be opened
+        simply never appears in `caps` -- and every later consumer counts what IS
+        there rather than what was expected.
+        """
+        want = set(get(self.cfg, "cameras.expected_labels", []) or [])
+        mapped = set((get(self.cfg, "cameras.by_usb_path", {}) or {}).values())
+        return sorted((want & mapped) - {c.label for c in self.caps})
+
     def status(self) -> list[dict[str, Any]]:
         return [
             {"label": c.label, "frames": c.frames_written,
-             "fps": round(c.fps, 1), "error": c.error}
+             "seen": c.frames_seen,
+             "fps": round(c.fps, 1), "error": c.error,
+             "timestamp_source": c.timestamp_source,
+             "read_lag_s": round(c.read_lag_s, 4),
+             "flipped_vertical": c.flip_vertical,
+             "stopped_early": c.stopped_early,
+             "stopped_at_s": round(c.stopped_at_s, 3)}
             for c in self.caps
         ]
 

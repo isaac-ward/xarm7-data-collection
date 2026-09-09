@@ -64,25 +64,53 @@ class RunRecorder:
         self.w["controller"].write(row)
 
     def commanded(self, t: float, world_xyz, rpy_deg, yaw_world_deg: float,
-                  gripper_closure: float, clamped: bool) -> None:
+                  gripper_closure: float, clamped: bool,
+                  reanchored: bool = False) -> None:
         self.w["commanded"].write({
             "t": t,
             "target_world_xyz_mm": [float(v) for v in world_xyz],
+            # base-frame euler, despite the neutral key name -- see the export, which
+            # ships it as action.commanded_rpy_base
             "target_rpy_deg": [float(v) for v in rpy_deg],
+            # yaw ACCUMULATED SINCE THE LAST RE-SEED, not an absolute world yaw: it is
+            # reset to 0 by re-home, clear-errors and servo recovery. Absolute
+            # orientation lives in target_rpy_deg.
             "target_yaw_world_deg": float(yaw_world_deg),
             "gripper_closure": float(gripper_closure),
             "clamped_by_workspace": bool(clamped),
+            # True on the tick where the target was snapped back to the measured pose
+            # because the arm stopped following. Without this the action says "still
+            # pushing" while the commanded pose teleports backwards, which is
+            # indistinguishable from intent.
+            "reanchored": bool(reanchored),
         })
 
     def xarm_command(self, t: float, pose_base: list[float], servo_code: Any,
-                     gripper_raw: float | None) -> None:
-        """Exactly what the SDK was handed, plus what it returned."""
-        self.w["xarm_command"].write({
+                     gripper_raw: float | None,
+                     gripper_sent: dict | None = None) -> None:
+        """Exactly what the SDK was handed, plus what it returned.
+
+        The servo pose is literally the argument, on this tick. The gripper is not: it
+        goes through a worker because the SDK has no non-blocking call, so
+        `set_gripper_position_queued` is what the loop ASKED for and
+        `gripper_sent_*` is what the worker actually handed the SDK, when, and what
+        came back. Those are different facts and conflating them made this stream a
+        statement of intent for the gripper.
+        """
+        row = {
             "t": t,
             "set_servo_cartesian_pose_base": [float(v) for v in pose_base],
             "servo_code": None if servo_code is None else int(servo_code),
-            "set_gripper_position": None if gripper_raw is None else float(gripper_raw),
-        })
+            "set_gripper_position_queued": (None if gripper_raw is None
+                                            else float(gripper_raw)),
+        }
+        if gripper_sent:
+            row["gripper_sent_position"] = gripper_sent.get("sent_position")
+            row["gripper_sent_t"] = gripper_sent.get("sent_t")
+            row["gripper_sent_code"] = gripper_sent.get("sent_code")
+            if gripper_sent.get("sent_error"):
+                row["gripper_sent_error"] = gripper_sent["sent_error"]
+        self.w["xarm_command"].write(row)
 
     def tick(self, t: float, dt: float, n: int, servo_code: Any, pad_ok: bool) -> None:
         """Loop health. Without this a degraded loop rate is invisible, and the action

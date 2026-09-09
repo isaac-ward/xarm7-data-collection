@@ -18,3 +18,9 @@ The manifest carries no kinematic chain (the reference drove body poses straight
 MuJoCo FK), so `armfk.js` implements xArm7 modified-DH forward kinematics instead. That
 table is VERIFIED against the real robot by the dashboard's "FK check" sanity button,
 which compares FK(joint angles) with the TCP pose the controller reports.
+
+`meshes/base_link.stl` is the GRIPPER's base body (MJCF `xarm_gripper_base_link`),
+not the arm's `link_base.stl`. It is referenced by `gripper_manifest.json` and was
+missing from the first vendoring, so `buildGripper` threw and arm3d.js's
+`catch { /* gripper optional */ }` dropped the whole gripper without a word. Copied
+from the same `pi05/deploy/static/meshes` as its siblings.

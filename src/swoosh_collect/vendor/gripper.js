@@ -63,6 +63,8 @@ export async function buildGripper(THREE, stlLoader, meshDir, manifest) {
     geom.computeVertexNormals();
     g.add(new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
       color: new THREE.Color(p.material_hex), metalness: 0.1, roughness: 0.7,
+      // match the arm: half-opaque so the box and target read through it
+      transparent: true, opacity: 0.5, depthWrite: false,
     })));                                                      // identity local transform
 
     if (p.moves_with_joint) {

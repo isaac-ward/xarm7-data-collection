@@ -19,6 +19,18 @@ x-base: &base
   environment:
     PYTHONUNBUFFERED: "1"
     DISPLAY: "${DISPLAY:-:0}"
+    # The service commands read these with $$VAR, i.e. INSIDE the container, so they
+    # must be forwarded explicitly -- compose does not pass the invoking shell's
+    # environment through. Without these lines `CAMPAIGN=x docker compose run collect`
+    # died on the :? guard, and worse, `SANITY_ARGS=--verify-frame ... run sanity`
+    # silently ran a plain check and reported "all checks passed" without ever jogging.
+    CAMPAIGN: "${CAMPAIGN:-}"
+    COLLECT_ARGS: "${COLLECT_ARGS:-}"
+    SANITY_ARGS: "${SANITY_ARGS:-}"
+    CAMERA_ARGS: "${CAMERA_ARGS:-}"
+    # The host-side path of this repo. /workspace means nothing to an operator reading
+    # the dashboard on the host, so anything shown to a human is rewritten to this.
+    SWOOSH_HOST_ROOT: "${PWD}"
   network_mode: host
   cap_add: [NET_ADMIN]
   group_add: ["video", "input"]
@@ -41,7 +53,7 @@ services:
     command: >
       bash -c "
       ip -4 -brief addr show ${SWOOSH_NIC:-enp129s0} | grep -q '192.168.1.100/'
-        || ip addr add 192.168.1.100/24 dev ${SWOOSH_NIC:-enp129s0};
+      || ip addr add 192.168.1.100/24 dev ${SWOOSH_NIC:-enp129s0};
       swoosh-collect --campaign \"$${CAMPAIGN:?set CAMPAIGN=<name>}\" $${COLLECT_ARGS:-}"
 
   sanity:
@@ -50,7 +62,7 @@ services:
     command: >
       bash -c "
       ip -4 -brief addr show ${SWOOSH_NIC:-enp129s0} | grep -q '192.168.1.100/'
-        || ip addr add 192.168.1.100/24 dev ${SWOOSH_NIC:-enp129s0};
+      || ip addr add 192.168.1.100/24 dev ${SWOOSH_NIC:-enp129s0};
       swoosh-sanity $${SANITY_ARGS:-}"
 
   cameras:

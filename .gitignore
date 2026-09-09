@@ -133,3 +133,6 @@ dmypy.json
 # collection output
 campaigns/
 logs/
+
+# throwaway diagnostic probes written while bringing the rig up
+.scratch/

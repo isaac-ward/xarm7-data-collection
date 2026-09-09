@@ -226,12 +226,27 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     # -- helpers -------------------------------------------------------------
-    def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None) -> None:
+    def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None,
+              gzip_ok: bool = False) -> None:
+        extra = dict(extra or {})
+        # The 3D view pulls ~4.4 MB (three.module.js unminified + 3.1 MB of STL), which
+        # is most of the wait before the arm appears. These compress well and the
+        # stdlib server does nothing automatically.
+        if gzip_ok and len(body) > 1400 and "gzip" in (
+                self.headers.get("Accept-Encoding") or "").lower():
+            import gzip as _gzip
+            body = _gzip.compress(body, 6)
+            extra["Content-Encoding"] = "gzip"
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (extra or {}).items():
+        # A caller-supplied Cache-Control has to WIN. This sent no-store
+        # unconditionally and THEN appended the caller's header, so /vendor/'s
+        # max-age was dead on arrival and the whole 4.4 MB was re-fetched on every
+        # page load, not just the first.
+        if "Cache-Control" not in extra:
+            self.send_header("Cache-Control", "no-store")
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         try:
@@ -255,12 +270,23 @@ class Handler(BaseHTTPRequestHandler):
             self._json(self._campaign_json())
         elif path == "/api/workspace":
             self._json({"box": get(self.cfg, "control.workspace_box_mm", {})})
+        elif path == "/api/campaign/list":
+            from .campaign import Campaign as _C
+            cur = self.campaign.path.name
+            self._json({"current": cur, "campaigns": [
+                {"slug": c.path.name, "name": c.meta.get("name", c.path.name),
+                 "runs": len(c.runs()), "active": c.path.name == cur}
+                for c in _C.list_all(self.cfg)]})
         elif path == "/api/root":
-            from .campaign import campaigns_root
+            from .campaign import campaigns_root, host_view
+            # host_view: the operator reads this on the HOST, where /workspace/... does
+            # not exist and cannot be pasted anywhere useful.
             self._json({"configured": str(get(self.cfg, "recording.campaigns_dir", "campaigns")),
-                        "resolved": str(campaigns_root(self.cfg))})
+                        "resolved": host_view(campaigns_root(self.cfg))})
         elif path == "/api/events":
             self._events()
+        elif path.startswith("/snapshot/"):
+            self._snapshot(unquote(path[len("/snapshot/"):].split("?")[0]))
         elif path.startswith("/stream/"):
             self._mjpeg(path.split("/", 2)[2])
         elif path.startswith("/api/run/"):
@@ -302,6 +328,38 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "campaign": self._campaign_json()})
             except Exception as exc:
                 self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
+        elif path == "/api/run/delete":
+            try:
+                import shutil
+                name = str(body.get("run", "")).strip()
+                run_dir = (self.campaign.path / name).resolve()
+                base = self.campaign.path.resolve()
+                # Never let a crafted name escape the campaign, and never delete a run
+                # that is still being written -- deleting mid-recording would leave the
+                # collector writing into a hole.
+                if not name or not str(run_dir).startswith(str(base) + "/"):
+                    raise ValueError("not a run in this campaign")
+                if not run_dir.is_dir():
+                    raise FileNotFoundError(name)
+                run = next((r for r in self.campaign.runs()
+                            if r.path.name == name), None)
+                if run is not None and run.status != "ready":
+                    raise ValueError(f"run is {run.status} -- stop it and let it "
+                                     f"finish processing before deleting")
+                shutil.rmtree(run_dir)
+                self.sanity.log(f"[dash] deleted run {name}")
+                self._json({"ok": True, "campaign": self._campaign_json()})
+            except Exception as exc:
+                self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
+        elif path == "/api/campaign/load":
+            try:
+                slug = str(body.get("slug", "")).strip()
+                if not slug:
+                    raise ValueError("pick a campaign")
+                self.campaign_ref["campaign"] = Campaign.open(slug, self.cfg)
+                self._json({"ok": True, "campaign": self._campaign_json()})
+            except Exception as exc:
+                self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
         elif path == "/api/open":
             self._open_folder(str(body.get("run", "")).strip())
         elif path == "/api/sanity/start":
@@ -317,7 +375,8 @@ class Handler(BaseHTTPRequestHandler):
             self._set_root(body)
         elif path == "/api/button":
             name = str(body.get("button", ""))
-            if name not in {"start_episode", "stop_episode", "rehome", "quit"}:
+            if name not in {"start_episode", "stop_episode", "rehome", "quit",
+                            "clear_errors"}:
                 self._json({"ok": False, "error": f"unknown button {name!r}"}, 400)
             else:
                 self.live.press(name)
@@ -325,10 +384,24 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, b"not found", "text/plain")
 
+    # These open a SECOND XArmAPI session and run clean_error / set_mode(0) /
+    # set_state(4), or open the cameras. Doing that during a recording freezes the arm
+    # while set_servo_cartesian keeps returning 0, so the action column goes on moving
+    # against a stationary arm -- and the cameras cannot be opened twice at all.
+    # SanityRunner only ever stopped two sanity jobs overlapping, never this.
+    _EXCLUSIVE = {"arm", "frame", "home", "gripper", "cameras", "fkcheck", "reach",
+                  "camlatency"}
+
     def _sanity_start(self, body: dict) -> None:
         import sys
 
         action = str(body.get("action", ""))
+        if action in self._EXCLUSIVE and bool(self.live.status.get("recording")):
+            self._json({"ok": False, "error":
+                        f"'{action}' takes over the arm and cameras -- stop the run "
+                        f"with B first. Running it now would freeze the arm mid-episode "
+                        f"while the recorded action kept moving."}, 409)
+            return
         py = sys.executable
         jobs: dict[str, list[str]] = {
             "arm":        [py, "-m", "swoosh_collect.sanity"],
@@ -424,7 +497,7 @@ class Handler(BaseHTTPRequestHandler):
             log("time-misaligned action before the data is used.")
 
     def _fk_check(self, log: Any) -> None:
-        """Is the xArm7 DH table behind the 3D view actually right?
+        """Is the kinematic chain behind the 3D view actually right?
 
         Compares FK(joint angles) with the TCP pose the CONTROLLER reports for the same
         instant. They should agree to within the TCP offset (the controller reports the
@@ -466,10 +539,10 @@ class Handler(BaseHTTPRequestHandler):
         n = float(np.linalg.norm(d))
         if n < 200:
             log(f"OK: FK and the controller agree to {n:.0f} mm -- plausible for a "
-                f"flange-vs-tool difference. The DH table looks right.")
+                f"flange-vs-tool difference. The chain looks right.")
         else:
             log(f"WARNING: {n:.0f} mm apart. That is too large to be a TCP offset; the "
-                f"DH table in kinematics.py / armfk.js is probably wrong, so the 3D "
+                f"chain in kinematics.py / armfk.js is probably wrong, so the 3D "
                 f"arm's pose is not trustworthy.")
 
     def _reach_check(self, log: Any) -> None:
@@ -538,19 +611,29 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         log(f"watching {label}; commanding the gripper closed")
-        base = self.live.get_frame(label).astype("float32")
-        arm.set_gripper(1.0)
-        t0 = time.monotonic()
+        # Take the gripper off the control loop first, or the loop's next tick queues
+        # the resting trigger value straight over the top of our command.
+        arm.gripper_suspend(True)
         hit = None
-        while time.monotonic() - t0 < 3.0:
-            f = self.live.get_frame(label)
-            if f is not None:
-                d = float(np.abs(f.astype("float32") - base).mean())
-                if d > 6.0:
-                    hit = time.monotonic() - t0
-                    break
-            time.sleep(0.005)
-        arm.set_gripper(0.0)
+        try:
+            arm.set_gripper(0.0, force=True)     # start from fully OPEN, known state
+            time.sleep(1.2)                      # let it finish travelling
+            base = self.live.get_frame(label).astype("float32")
+            arm.set_gripper(1.0, force=True)     # now CLOSE, and watch for it
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 3.0:
+                f = self.live.get_frame(label)
+                if f is not None:
+                    d = float(np.abs(f.astype("float32") - base).mean())
+                    if d > 6.0:
+                        hit = time.monotonic() - t0
+                        break
+                time.sleep(0.005)
+            time.sleep(0.4)
+            arm.set_gripper(0.0, force=True)     # reopen, back to a known state
+            time.sleep(0.8)
+        finally:
+            arm.gripper_suspend(False)           # hand it back to the operator
         if hit is None:
             log("no visible change within 3 s -- is the gripper in view?")
             return
@@ -623,21 +706,41 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 400)
 
     def _open_folder(self, run: str) -> None:
-        """Open the campaign folder, or one run folder, in the desktop file manager."""
+        """Open a folder in the desktop file manager, or hand back the host path.
+
+        The collector normally runs INSIDE the container, where there is no desktop
+        session and no file manager: xdg-open's Popen succeeded, so this reported
+        ok=true, and nothing whatsoever happened. The path it would have opened was a
+        container path (/workspace/...) that does not exist on the host either.
+
+        So: only attempt xdg-open when not containerised, and otherwise return the
+        HOST-side path for the operator to paste. Saying "here is the path, I cannot
+        open it from in here" beats silently doing nothing.
+        """
         import subprocess
+        from pathlib import Path as _P
+
+        from .campaign import host_view
 
         base = self.campaign.path.resolve()
         target = (base / run).resolve() if run else base
         if not str(target).startswith(str(base)) or not target.is_dir():
             self._json({"ok": False, "error": "no such folder"}, 404)
             return
+        host_path = host_view(target)
+        if _P("/.dockerenv").exists():
+            self._json({"ok": False, "containerised": True, "path": host_path,
+                        "error": "The collector is running inside Docker, which has "
+                                 "no desktop session -- it cannot open your file "
+                                 "manager. The folder on this machine is:"})
+            return
         try:
             subprocess.Popen(["xdg-open", str(target)],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self._json({"ok": True, "path": str(target)})
+            self._json({"ok": True, "path": host_path})
         except Exception as exc:
             self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}",
-                        "path": str(target)}, 500)
+                        "path": host_path}, 500)
 
     # -- payloads ------------------------------------------------------------
     def _campaign_json(self) -> dict[str, Any]:
@@ -674,6 +777,33 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(1.0 / 15.0)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
+
+    def _snapshot(self, label: str) -> None:
+        """One JPEG, then the connection closes.
+
+        The four previews used to be long-lived MJPEG streams, one open connection
+        each. With the SSE stream that is five of a browser's six-per-origin budget,
+        on an HTTP/1.0 server with no keep-alive, while ~20 vendor files and the log
+        poll competed for what was left -- so the last two panes (the gripper pair,
+        last in expected_labels) never got a connection and sat frozen. Polling single
+        frames holds nothing open, and the preview was already throttled to 10 fps by
+        design, so nothing is lost.
+        """
+        try:
+            import cv2
+        except ImportError:
+            self._send(500, b"opencv missing", "text/plain")
+            return
+        frame = self.live.get_frame(label)
+        if frame is None:
+            self._send(503, b"no frame yet", "text/plain")
+            return
+        small = cv2.resize(frame, (320, 240))
+        ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        if not ok:
+            self._send(500, b"encode failed", "text/plain")
+            return
+        self._send(200, buf.tobytes(), "image/jpeg")
 
     def _mjpeg(self, label: str) -> None:
         try:
@@ -723,23 +853,58 @@ class Handler(BaseHTTPRequestHandler):
             return
         ctl = _thin(_read_jsonl(run_dir / "raw" / "controller.jsonl"), 30.0)
         stt = _thin(_read_jsonl(run_dir / "raw" / "arm_state.jsonl"), 30.0)
-        cams = []
-        for m in sorted((run_dir / "video").glob("*_frame_times.json")):
-            d = json.loads(m.read_text())
-            cams.append({"label": d["label"], "t0": (d.get("t") or [0.0])[0],
-                         "url": f"/media/{name}/video/{d['label']}.mp4"})
+        cam_meta = [json.loads(m.read_text())
+                    for m in sorted((run_dir / "video").glob("*_frame_times.json"))]
+
+        # RUN-RELATIVE TIME, TRIMMED TO THE FULLY-COVERED WINDOW.
+        #
+        # Raw timestamps are measured from t_loop0 -- the start of the whole session --
+        # so a run that began 111 s in has rows at t=111.6..127.2. The player drives
+        # `apply(t)` with t in 0..duration, so every lookup landed before the first row
+        # and returned it: the page rendered one frozen sample and nothing moved.
+        #
+        # And the cameras open on a staggered worker, so each mp4 begins up to ~1.8 s
+        # after the control streams. Starting the timeline at the earliest stream meant
+        # the first couple of seconds had some panes with no video at all, which is the
+        # glitchy opening. Start at the LATEST start and end at the EARLIEST end -- the
+        # window where every stream is present -- which is also exactly the window the
+        # exporter keeps, so playback shows what the dataset will contain.
+        starts = [r["t"] for r in (ctl[:1] + stt[:1])]
+        starts += [(d.get("t") or [0.0])[0] for d in cam_meta]
+        ends = [r["t"] for r in (ctl[-1:] + stt[-1:])]
+        ends += [(d.get("t") or [0.0])[-1] for d in cam_meta]
+        t0 = max(starts) if starts else 0.0
+        t1 = min(ends) if ends else t0
+        covered = max(0.0, t1 - t0)
+
+        # keep only rows inside the covered window
+        ctl = [r for r in ctl if t0 <= r["t"] <= t1]
+        stt = [r for r in stt if t0 <= r["t"] <= t1]
+
+        cams = [{"label": d["label"],
+                 # seconds into this camera's mp4 that the covered window begins, so
+                 # the player seeks each video by (t + skip) and they stay in step
+                 "skip": max(0.0, t0 - (d.get("t") or [0.0])[0]),
+                 "url": f"/media/{name}/video/{d['label']}.mp4"}
+                for d in cam_meta]
         meta = {}
         if (run_dir / "run.json").is_file():
             meta = json.loads((run_dir / "run.json").read_text())
         self._json({
             "name": name,
-            "duration_s": meta.get("duration_s", 0.0),
+            # the COVERED duration, not the recorded one: playback spans only the
+            # window where every stream has data
+            "duration_s": covered,
+            "recorded_duration_s": meta.get("duration_s", 0.0),
+            "trimmed_s": max(0.0, meta.get("duration_s", 0.0) - covered),
+            # t0 is kept so a consumer can get back to the raw clock if it needs to
+            "t_origin": t0,
             "controller": [
-                {"t": r["t"], "mx": r.get("move_x", 0), "my": r.get("move_y", 0),
+                {"t": r["t"] - t0, "mx": r.get("move_x", 0), "my": r.get("move_y", 0),
                  "h": r.get("height", 0), "yaw": r.get("yaw", 0),
                  "g": r.get("gripper", 0)} for r in ctl],
             "proprio": [
-                {"t": r["t"], "j": r.get("joints_deg") or [],
+                {"t": r["t"] - t0, "j": r.get("joints_deg") or [],
                  "w": r.get("pose_world_xyz_mm") or [],
                  "gp": r.get("gripper_pos")} for r in stt],
             "cameras": cams,
@@ -753,7 +918,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         ctype = {"js": "text/javascript", "css": "text/css", "json": "application/json",
                  "stl": "model/stl"}.get(target.suffix.lstrip("."), "application/octet-stream")
-        self._send(200, target.read_bytes(), ctype, {"Cache-Control": "max-age=3600"})
+        # `immutable` was wrong here and cost an afternoon: it is only correct for
+        # content-addressed URLs, and /vendor/arm3d.js is a stable path whose CONTENT
+        # we edit. Browsers then served a stale module for a week and the 3D view
+        # silently kept running the previous code.
+        # An ETag gets both properties: a conditional request per file (trivial on
+        # localhost) and a 304 that re-sends none of the 4.4 MB when nothing changed.
+        data = target.read_bytes()
+        st = target.stat()
+        etag = f'W/"{st.st_mtime_ns:x}-{st.st_size:x}"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
+        self._send(200, data, ctype,
+                   {"Cache-Control": "no-cache", "ETag": etag}, gzip_ok=True)
 
     def _media(self, rel: str) -> None:
         base = self.campaign.path.resolve()
@@ -764,8 +945,43 @@ class Handler(BaseHTTPRequestHandler):
         ctype = {"mp4": "video/mp4", "png": "image/png",
                  "json": "application/json"}.get(target.suffix.lstrip("."),
                                                  "application/octet-stream")
-        data = target.read_bytes()
-        self._send(200, data, ctype, {"Accept-Ranges": "none"})
+        size = target.stat().st_size
+
+        # RANGE REQUESTS. This used to answer "Accept-Ranges: none" and send the whole
+        # file, which meant the browser could not SEEK: assigning video.currentTime was
+        # ignored, so scrubbing did nothing and the playback panes sat on frame 0 while
+        # the numbers moved. A <video> being driven to a timestamp needs ranges.
+        rng = self.headers.get("Range")
+        if rng and rng.startswith("bytes="):
+            try:
+                lo_s, _, hi_s = rng[len("bytes="):].partition("-")
+                lo = int(lo_s) if lo_s else 0
+                hi = int(hi_s) if hi_s else size - 1
+                hi = min(hi, size - 1)
+                if lo > hi or lo >= size:
+                    raise ValueError("unsatisfiable")
+            except ValueError:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+            with target.open("rb") as fh:
+                fh.seek(lo)
+                chunk = fh.read(hi - lo + 1)
+            self.send_response(206)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(chunk)))
+            self.send_header("Content-Range", f"bytes {lo}-{hi}/{size}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        self._send(200, target.read_bytes(), ctype, {"Accept-Ranges": "bytes"})
 
 
 class DashboardServer:
@@ -873,13 +1089,22 @@ button.green:hover{background:#0b7d45;color:#fff}
 #left{display:flex;flex-direction:column;height:100%;min-width:0;overflow:hidden}
 #right{display:flex;flex-direction:column;height:100%;min-width:0;overflow:hidden;padding:0 10px 0}
 #imgblock{display:flex;flex-direction:column;min-height:0;overflow:hidden}
-#panelblock{display:flex;flex-direction:column;min-height:0;overflow:auto;padding-bottom:8px}
+#panelblock{display:flex;flex-direction:column;min-height:0;overflow:hidden;padding-bottom:8px;
+  container-type:inline-size}
 #campaignpane{display:flex;flex-direction:column;min-height:0;overflow:hidden}
 #sanity{display:flex;flex-direction:column;min-height:0;overflow:hidden;background:var(--panel);
   border-top:1px solid var(--line);padding:8px 10px}
 .hd{padding:12px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
 h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
 #runs{flex:1;overflow:auto;padding:7px}
+/* Campaign total sits below the scrolling run list, always visible. */
+#camptotal{flex:none;border-top:1px solid var(--line);background:var(--panel);
+  padding:7px 11px;display:flex;justify-content:space-between;align-items:baseline;
+  font-variant-numeric:tabular-nums}
+#camptotal .lb{font-size:10px;text-transform:uppercase;letter-spacing:.07em;
+  color:var(--dim);font-weight:700}
+#camptotal .tv{font-size:15px;font-weight:700}
+#camptotal .sub2{font-size:11px;color:var(--dim);font-weight:400;margin-left:6px}
 .run{padding:7px 9px;border:1px solid var(--line);background:#fff;margin-bottom:5px;cursor:pointer;
   display:flex;gap:8px;align-items:center}
 .run:hover{border-color:var(--blue)} .run.sel{border-color:var(--blue);background:#eaf2fe}
@@ -897,6 +1122,8 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
  45%{transform:translateX(-5px)}60%{transform:translateX(4px)}75%{transform:translateX(-2px)}}
 .run.wiggle{animation:wig .42s ease;border-color:var(--red)!important;background:#fdeceb}
 .iconbtn{font-size:11px;padding:2px 6px;color:var(--dim)}
+.iconbtn.del{color:var(--red);border-color:var(--line)}
+.iconbtn.del:hover{background:var(--red);color:#fff;border-color:var(--red)}
 #sanity h3{margin:0 0 6px;font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--dim);
   font-weight:700;display:flex;align-items:center;gap:7px;flex:none}
 #sanity h3 .sp{margin-left:auto;display:flex;gap:5px}
@@ -909,7 +1136,7 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
 /* ticker: flush to the panel edges, scrolls forever like a stock ticker */
 #ticker{flex:none;overflow:hidden;white-space:nowrap;border-bottom:1px solid var(--line);
   margin:0 -10px;padding:5px 0;font-weight:800;letter-spacing:.16em;font-size:12px}
-#ticker .t{display:inline-block;animation:scroll 26s linear infinite;will-change:transform}
+#ticker .t{display:inline-block;animation:scroll 52s linear infinite;will-change:transform}
 @keyframes scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
 #ticker.blue{color:var(--blue);background:#eaf2fe}
 #ticker.green{color:var(--green);background:#e9f7ef}
@@ -919,25 +1146,59 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
 .badge.live{background:var(--blue)} .badge.rec{background:var(--red)} .badge.rep{background:var(--green)}
 #cams{display:grid;grid-template-columns:1fr 1fr;gap:6px;min-height:0;flex:1 1 auto}
 .cam{position:relative;background:#000;overflow:hidden;min-height:0}
-.cam img,.cam video{width:100%;height:100%;object-fit:cover;display:block}
+/* contain, never cover: `cover` crops whatever does not fit the pane's aspect,
+   which silently hid the edges of every feed -- and the edges are where you check
+   whether the gripper is actually in frame. Letterbox against the black instead.
+   width/height 100% + contain re-fits on every resize with no JS. */
+.cam img,.cam video{width:100%;height:100%;object-fit:contain;display:block}
 .cam .lb{position:absolute;left:5px;top:4px;font-size:10px;background:#000a;color:#fff;padding:1px 5px}
-.panels{display:grid;grid-template-columns:auto 1.35fr auto;gap:8px;flex:none;padding-top:8px}
-.scene{display:flex;gap:8px;align-items:stretch}
-#wsfields{display:flex;flex-direction:column;gap:3px;justify-content:center}
-#wsfields label{font-size:10px;color:var(--dim);display:flex;align-items:center;gap:4px}
-#wsfields input{width:66px;padding:2px 4px;font-size:11px;border:1px solid var(--line);
+/* Three panes with draggable boundaries (Split.js sets the widths inline), so the
+   operator decides how much goes to the pad, the numbers and the 3D view. That
+   replaces a fixed grid whose column widths could never suit every screen. */
+.panels{display:flex;flex:1 1 auto;min-height:0;padding-top:8px}
+.panels>.card{min-width:0;min-height:0}
+/* Controller stacks downward -- pad, then face buttons, then triggers -- so it needs
+   only the canvas's width instead of sitting beside the buttons. */
+.ctlstack{display:flex;flex-direction:column;gap:7px;align-items:flex-start;
+  min-height:0;overflow:hidden}
+.ctlstack #trig{width:100%}
+#pad{max-width:100%;height:auto}
+/* arm3d fills; the workspace box fields are a horizontal strip beneath it. */
+.scene{display:flex;flex-direction:column;gap:7px;flex:1 1 auto;min-height:0;min-width:0}
+#wsfields{flex:none;display:flex;flex-wrap:wrap;gap:4px 7px;align-items:center}
+#wsfields label{font-size:9px;letter-spacing:.02em;color:var(--dim);display:flex;
+  align-items:center;gap:3px;white-space:nowrap}
+#wsfields input{width:50px;padding:2px 3px;font-size:11px;border:1px solid var(--line);
   font-variant-numeric:tabular-nums}
-#arm3d{width:100%;height:100%;min-height:170px;max-height:100%;aspect-ratio:2/1;
+#arm3d{flex:1 1 auto;min-width:0;min-height:0;width:100%;height:100%;
   background:#f6f7f9;border:1px solid var(--line)}
-#arm3d canvas{display:block}
+/* three.js is called with setSize(w,h,false) -- updateStyle FALSE -- so it sets
+   the drawing buffer but not the CSS size. With setPixelRatio(2) on a HiDPI
+   screen the element then defaults to its attribute size, twice the container,
+   and the scene gets cut off. Pin the CSS size to the box instead. */
+#arm3d canvas{display:block;width:100%!important;height:100%!important}
 .card{background:var(--panel);border:1px solid var(--line);padding:9px}
-.card{display:flex;flex-direction:column}
+.card{display:flex;flex-direction:column;min-height:0;min-width:0;overflow:hidden}
 .card h2{margin:0 0 7px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);font-weight:700}
 .row{display:flex;justify-content:space-between;gap:10px;font-variant-numeric:tabular-nums;padding:1px 0}
+/* label over value, for readings too wide to sit beside their name */
+.stackrow{display:flex;flex-direction:column;padding:1px 0 3px;
+  font-variant-numeric:tabular-nums}
+.stackrow .k{color:var(--dim);font-size:11px}
+.stackrow .v{color:#000;font-weight:600}
 .row span:last-child{color:#000;font-weight:600}
 .bar{height:4px;background:#e3e6ea;overflow:hidden;margin-top:2px}
 .bar>div{height:100%;background:#000}
 .abxy{display:grid;grid-template-columns:repeat(3,30px);grid-template-rows:repeat(3,30px);gap:3px}
+/* face buttons beside a legend saying what each one does */
+.padrow{display:flex;gap:11px;align-items:flex-start}
+.btnkey{display:grid;grid-template-columns:auto 1fr;gap:2px 6px;margin:0;
+  align-content:start;align-items:baseline}
+.btnkey dt{font:700 10px/1.5 ui-sans-serif,system-ui,sans-serif;color:#fff;
+  text-align:center;padding:0 4px;min-width:15px}
+.btnkey dd{margin:0;font-size:11px;color:var(--dim);white-space:nowrap}
+.btnkey .ka{background:#107C10} .btnkey .kb{background:#D13438}
+.btnkey .kx{background:#0A5C96} .btnkey .ky{background:#F7B500;color:#3a2c00}
 .abxy button{width:30px;height:30px;padding:0;font-weight:800;font-size:13px;color:#fff}
 /* real Xbox face-button colours */
 .abxy .a{background:#107C10;border-color:#107C10}
@@ -977,12 +1238,14 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
       <div class=sub id=csub></div>
       <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
         <button class=blue onclick=newCampaign()>+ New campaign</button>
+        <button onclick=loadCampaign_pick()>Load campaign</button>
         <button onclick=chooseRoot()>Choose root folder</button>
         <button onclick="openFolder('')">Open campaign folder</button>
       </div>
       <div class=sub id=rootpath style="margin-top:6px;font-size:11px;word-break:break-all"></div>
     </div>
     <div id=runs></div>
+    <div id=camptotal></div>
   </div>
   <div id=sanity>
     <h3>sanity <span id=srun></span>
@@ -992,13 +1255,13 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
       </span>
     </h3>
     <div class=sbtns>
-      <button class=sbtn onclick="sanity('arm')" title="Connect, clear errors, print firmware/joints/pose. Read-only.">check arm</button>
-      <button class="sbtn red" onclick=confirmFrame() title="MOVES THE ARM: jogs 20mm along each world axis to prove the 45-degree mount maths.">verify 45&deg; frame</button>
-      <button class=sbtn onclick=nameCameras() title="Assign labels to cameras by USB port.">name cameras</button>
+      <button class=sbtn onclick="sanity('arm')" data-excl data-tip="Connect, clear errors, print firmware/joints/pose. Read-only." title="Connect, clear errors, print firmware/joints/pose. Read-only.">check arm</button>
+      <button class="sbtn red" onclick=confirmFrame() data-excl title="MOVES THE ARM: jogs 20mm along each world axis to prove the 45-degree mount maths.">verify 45&deg; frame</button>
+      <button class=sbtn onclick=nameCameras() data-excl title="Assign labels to cameras by USB port.">name cameras</button>
       <button class=sbtn onclick="sanity('lag')" title="Sweep lag on the latest run; a U-shaped minimum means the action is time-aligned.">cmd&rarr;measured lag</button>
-      <button class="sbtn red" onclick=confirmCamLatency() title="MOVES THE GRIPPER: measures action-to-pixel latency.">camera latency</button>
-      <button class=sbtn onclick="sanity('fkcheck')" title="Compare FK(joints) with the controller's own TCP pose -- verifies the DH table behind the 3D view.">FK check</button>
-      <button class=sbtn onclick="sanity('reach')" title="Are all 8 corners of the safety box reachable?">workspace reach</button>
+      <button class="sbtn red" onclick=confirmCamLatency() data-excl title="MOVES THE GRIPPER: measures action-to-pixel latency.">camera latency</button>
+      <button class=sbtn onclick="sanity('fkcheck')" data-excl data-tip="Compare FK(joints) with the controller's own TCP pose -- verifies the chain behind the 3D view." title="Compare FK(joints) with the controller's own TCP pose -- verifies the chain behind the 3D view.">FK check</button>
+      <button class=sbtn onclick="sanity('reach')" data-excl data-tip="Are all 8 corners of the safety box reachable?" title="Are all 8 corners of the safety box reachable?">workspace reach</button>
       <button class=sbtn onclick="sanity('validate')" title="Check every run for the known failure modes.">validate runs</button>
       <button class=sbtn onclick="sanity('preview')" id=pvbtn title="Feed the dashboard synthetic data (no hardware).">preview mode</button>
     </div>
@@ -1022,20 +1285,29 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
   </div>
   <div id=panelblock>
   <div class=panels>
-    <div class=card><h2>controller</h2>
-      <div style="display:flex;gap:10px;align-items:flex-start">
+    <div class="card" id=cardctl><h2>controller</h2>
+      <div class=ctlstack>
         <canvas id=pad width=224 height=120></canvas>
-        <div class=abxy>
-          <button class=y onclick="press('rehome')">Y</button>
-          <button class=x disabled>X</button>
-          <button class=b onclick="press('stop_episode')">B</button>
-          <button class=a onclick="press('start_episode')">A</button>
+        <div class=padrow>
+          <div class=abxy>
+            <button class=y onclick="press('rehome')" title="re-home the arm">Y</button>
+            <button class=x onclick="press('clear_errors')"
+                    title="clear errors + warnings, re-enter servo mode">X</button>
+            <button class=b onclick="press('stop_episode')" title="stop recording">B</button>
+            <button class=a onclick="press('start_episode')" title="start recording">A</button>
+          </div>
+          <dl class=btnkey>
+            <dt class=ka>A</dt><dd>start run</dd>
+            <dt class=kb>B</dt><dd>stop run</dd>
+            <dt class=kx>X</dt><dd>clear errors</dd>
+            <dt class=ky>Y</dt><dd>re-home</dd>
+          </dl>
         </div>
+        <div id=trig></div>
       </div>
-      <div id=trig style="margin-top:6px"></div>
     </div>
-    <div class=card><h2>proprioception</h2><div id=prop></div></div>
-    <div class=card><h2>3D scene</h2>
+    <div class="card" id=cardprop><h2>proprioception</h2><div id=prop></div></div>
+    <div class="card" id=cardscene><h2>3D scene</h2>
       <div class=scene>
         <div id=arm3d></div>
         <div id=wsfields></div>
@@ -1068,19 +1340,42 @@ function setTicker(text, cls){
 addEventListener('resize',()=>{ const k=tickertext.dataset.k; tickertext.dataset.k='';
   if(k) setTicker(k.replace(/(blue|green|red)$/,''), k.match(/(blue|green|red)$/)?.[0]||'blue'); });
 function fmt(v,n=1){return (v==null||isNaN(v))?'--':Number(v).toFixed(n)}
+// HH:MM:SS. Rounds to whole seconds, so a campaign total is the sum of what is
+// displayed rather than drifting from it.
+function hms(sec){
+  if(sec==null||isNaN(sec)) return '--:--:--';
+  const t=Math.max(0,Math.round(Number(sec)));
+  const h=Math.floor(t/3600), m=Math.floor((t%3600)/60), s=t%60;
+  return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+}
 
 // resizable panes -- Split.js, vendored so the page needs no network
 Split(['#left','#right'],{sizes:[34,66],minSize:[260,420],gutterSize:5,cursor:'col-resize'});
 Split(['#campaignpane','#sanity'],{direction:'vertical',sizes:[58,42],
   minSize:[110,150],gutterSize:5,cursor:'row-resize'});
 // images (+ their playback bar) above, the controller/proprioception/3D panels below
-Split(['#imgblock','#panelblock'],{direction:'vertical',sizes:[52,48],
+Split(['#imgblock','#panelblock'],{direction:'vertical',sizes:[50,50],
   minSize:[140,180],gutterSize:5,cursor:'row-resize'});
+// controller | proprioception | 3D scene, each boundary draggable. The 3D view takes
+// the largest default share and arm3d.js already has a ResizeObserver, so it re-renders
+// as the gutters move.
+Split(['#cardctl','#cardprop','#cardscene'],{sizes:[20,20,60],
+  minSize:[120,110,140],gutterSize:5,cursor:'col-resize'});
 
 async function loadCampaign(){
   const c=await (await fetch('/api/campaign')).json();
   cname.textContent=c.name;
   csub.textContent=`${c.runs.length} run(s) - ${c.complete} complete`;
+  // Sum only runs that finished processing -- the same ones showing a duration, so the
+  // total always equals the sum of what is on screen. Rounded per-run first, for the
+  // same reason.
+  const done=c.runs.filter(r=>r.status==='ready');
+  const totalS=done.reduce((a,r)=>a+Math.max(0,Math.round(r.duration_s||0)),0);
+  const pending=c.runs.length-done.length;
+  camptotal.innerHTML=`<span class=lb>campaign total</span>`
+    +`<span><span class=tv>${hms(totalS)}</span>`
+    +`<span class=sub2>${done.length} run(s)`
+    +`${pending?` &middot; ${pending} not counted yet`:''}</span></span>`;
   runs.innerHTML='';
   c.runs.slice().reverse().forEach(r=>{
     const d=document.createElement('div');
@@ -1090,30 +1385,111 @@ async function loadCampaign(){
     d.innerHTML=`<span class="dot${r.complete?'':' bad'}"></span>
       <div class=meta><div><span class=n>${String(r.index).padStart(4,'0')}</span> ${tag}</div>
       <div class=ts>${r.timestamp||''}</div></div>
-      <span class=d>${fmt(r.duration_s)}s</span>
-      <button class=iconbtn title="open this run's folder">Open run folder</button>`;
+      <span class=d title="HH:MM:SS -- shown once processing is done">${r.status==='ready'?hms(r.duration_s):'--:--:--'}</span>
+      <button class=iconbtn title="open this run's folder">Open run folder</button>
+      <button class="iconbtn del" title="delete this run permanently">Delete</button>`;
     d.querySelector('.iconbtn').onclick=e=>{e.stopPropagation();openFolder(r.name)};
+    d.querySelector('.del').onclick=e=>{e.stopPropagation();delRun(r.name,r.duration_s)};
     d.onclick=()=>{ if(r.status!=='ready'){wiggle(d);return} openRun(r.name); };
     runs.appendChild(d);
   });
+}
+function delRun(name,dur){
+  // Deleting a run destroys raw data that cannot be re-recorded, so it asks first and
+  // names what is going away.
+  showModal(`<h4>Delete this run?</h4>
+    <p><b>${name}</b> &middot; ${hms(dur)}<br>
+    Its raw streams, videos and summary are removed from disk permanently. There is no
+    undo, and a recording cannot be reproduced.</p>
+    <div class=mact><button onclick=closeModal()>Cancel</button>
+    <button class=red onclick="doDelRun('${name}')">Delete permanently</button></div>`);
+}
+async function doDelRun(name){
+  const r=await (await fetch('/api/run/delete',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({run:name})})).json();
+  closeModal();
+  if(!r.ok){ toast(r.error||'could not delete'); return; }
+  if(SEL===name){ SEL=null; goLive(); }
+  loadCampaign();
+}
+async function loadCampaign_pick(){
+  const r=await (await fetch('/api/campaign/list')).json();
+  if(!r.campaigns || !r.campaigns.length){ toast('no campaigns yet - create one first'); return; }
+  showModal(`<h4>Load campaign</h4>
+    <p>Switches where new runs are written. A run in progress must be stopped first.</p>
+    <div class=mrow><label>campaign</label>
+      <select id=campin style="flex:2">${r.campaigns.map(c=>
+        `<option value="${c.slug}" ${c.active?'selected':''}>${c.name} - ${c.runs} run(s)`
+        +`${c.active?'  (current)':''}</option>`).join('')}</select></div>
+    <div class=mact><button onclick=closeModal()>Cancel</button>
+    <button class=blue onclick=doLoadCampaign()>Load</button></div>`);
+}
+async function doLoadCampaign(){
+  const slug=document.getElementById('campin').value;
+  const r=await (await fetch('/api/campaign/load',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({slug})})).json();
+  if(!r.ok){ toast(r.error||'could not load'); return; }
+  closeModal(); SEL=null; REP=null; goLive(); loadCampaign();
 }
 function wiggle(el){ el.classList.remove('wiggle'); void el.offsetWidth;
   el.classList.add('wiggle'); setTimeout(()=>el.classList.remove('wiggle'),500); }
 async function openFolder(run){
   const r=await (await fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({run:run||''})})).json();
-  if(!r.ok) toast('could not open folder: '+(r.error||'')); }
+  if(r.ok) return;
+  if(r.containerised){
+    // Give them something they can actually use: the host path, selected ready to copy.
+    showModal(`<h4>Folder on this machine</h4>
+      <p>${r.error}</p>
+      <div class=mrow><input id=fpath readonly value="${r.path}" style="flex:2"></div>
+      <div class=mact><button onclick=closeModal()>Close</button>
+      <button class=blue onclick="copyPath()">Copy path</button></div>`);
+    const i=document.getElementById('fpath'); i.focus(); i.select();
+    return;
+  }
+  toast('could not open folder: '+(r.error||'')); }
+async function copyPath(){
+  const v=document.getElementById('fpath').value;
+  try{ await navigator.clipboard.writeText(v); toast('path copied'); }
+  catch(e){ toast('select the text and copy it manually'); } }
 async function press(button){
   const r=await (await fetch('/api/button',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({button})})).json();
   if(!r.ok) toast(r.error||'button failed'); }
 
+// Where each feed sits in the 2x2, read row-major: TL, TR, BL, BR.
+// Scene pair down the left, right-gripper pair down the right, top above bottom --
+// so the grid mirrors the rig instead of following expected_labels' order.
+const CAM_SLOTS=['scene_left','gripper_right_top','scene_right','gripper_right_bottom'];
+function camOrder(labels){
+  return labels.slice().sort((a,b)=>{
+    const ia=CAM_SLOTS.indexOf(a), ib=CAM_SLOTS.indexOf(b);
+    return (ia<0?99:ia)-(ib<0?99:ib);
+  });
+}
+let POLL=[];        // one self-pacing snapshot loop per live camera
+function stopPolling(){ POLL.forEach(p=>{p.stop=true}); POLL=[]; }
 function camGrid(labels,playback){
-  CAMS=labels; cams.innerHTML='';
+  CAMS=labels; cams.innerHTML=''; stopPolling();
+  labels=camOrder(labels);
   labels.forEach(l=>{ const d=document.createElement('div'); d.className='cam';
     d.innerHTML = playback ? `<video id="v_${l}" muted preload=auto></video><span class=lb>${l}</span>`
-                           : `<img src="/stream/${l}"><span class=lb>${l}</span>`;
+                           : `<img id="s_${l}" alt="${l}"><span class=lb>${l}</span>`;
     cams.appendChild(d); });
+  if(playback) return;
+  // Ask for the next frame only once the previous one has arrived. That self-paces to
+  // whatever the machine can actually deliver and, crucially, never holds a connection
+  // open -- four persistent MJPEG streams starved the browser's per-origin budget and
+  // left the last two panes frozen.
+  labels.forEach(l=>{
+    const img=document.getElementById('s_'+l); if(!img) return;
+    const p={stop:false}; POLL.push(p);
+    const next=()=>{ if(p.stop) return;
+      setTimeout(()=>{ if(!p.stop) img.src='/snapshot/'+encodeURIComponent(l)+'?n='+Date.now(); },40); };
+    img.onload=next;
+    img.onerror=next;      // 503 before the first frame lands is normal; keep asking
+    img.src='/snapshot/'+encodeURIComponent(l)+'?n='+Date.now();
+  });
 }
 const es=new EventSource('/api/events');
 es.onmessage=e=>{ LIVE=JSON.parse(e.data);
@@ -1122,27 +1498,17 @@ es.onmessage=e=>{ LIVE=JSON.parse(e.data);
     if(st.cameras && st.cameras.join()!==CAMS.join()) camGrid(st.cameras,false);
     modetxt.textContent=st.recording?`${st.run_name||''} - ${fmt(st.elapsed)}s`:(st.hint||'');
     PREVIEW=!!st.preview;
+    // Mirror the server-side lockout: these take over the arm and cameras, so they
+    // must not look available during a run.
+    document.querySelectorAll('#sanity .sbtn[data-excl]').forEach(b=>{
+      b.disabled=!!st.recording;
+      if(st.recording){ if(!b.dataset.tip0) b.dataset.tip0=b.title;
+        b.title='unavailable during a run - press B to stop first'; }
+      else if(b.dataset.tip0){ b.title=b.dataset.tip0; }
+    });
     if(st.recording) setTicker('RECORDING','red');
     else if(PREVIEW)  setTicker('SIMULATED','blue');
-    else              function buildWsFields(box){
-  const rows=[['x',0,'x min'],['x',1,'x max'],['y',0,'y min'],['y',1,'y max'],
-              ['z',0,'z min'],['z',1,'z max']];
-  wsfields.innerHTML=rows.map(([ax,i,lb])=>
-    `<label>${lb}<input type=number step=10 data-ax="${ax}" data-i="${i}"
-       value="${box[ax][i]}"></label>`).join('');
-  wsfields.querySelectorAll('input').forEach(inp=>{
-    inp.onchange=async()=>{
-      const b={x:[0,0],y:[0,0],z:[0,0]};
-      wsfields.querySelectorAll('input').forEach(x=>{
-        b[x.dataset.ax][+x.dataset.i]=parseFloat(x.value); });
-      ARM.setWorkspace(b);
-      const r=await (await fetch('/api/workspace',{method:'POST',
-        headers:{'Content-Type':'application/json'},body:JSON.stringify({box:b})})).json();
-      if(!r.ok) toast(r.error||'could not save workspace');
-    };
-  });
-}
-setTicker('LIVE','green');
+    else              setTicker('LIVE','green');
     if(ARM){ ARM.setJoints(LIVE.proprio?.joints||[], 1-((LIVE.controller?.gripper)||0));
              ARM.setTarget(LIVE.proprio?.target||null, LIVE.proprio?.target_yaw||0); }
   }};
@@ -1162,15 +1528,22 @@ function draw(c){
   stick(ctx,54,50,40, c.move_y??c.my??0, c.move_x??c.mx??0, 'move in surface plane');
   stick(ctx,164,50,40, c.yaw??0, c.height??c.h??0, 'height / yaw');
   const g=c.gripper??c.g??0;
+  // Left trigger is unbound but still displayed: a live number is how you tell a
+  // dead pad from one nobody is touching.
+  const lt=(c.raw&&c.raw.ABS_Z!=null)?c.raw.ABS_Z:null;
   trig.innerHTML=
-    `<div class=row><span>left trigger</span><span class=sub>not bound</span></div>
-     <div class=bar><div style="width:0%"></div></div>
+    `<div class=row><span>left trigger <span class=sub>(unbound)</span></span>
+       <span>${lt==null?'--':fmt(lt,2)}</span></div>
+     <div class=bar><div style="width:${lt==null?0:(lt*100).toFixed(0)}%"></div></div>
      <div class=row><span>right trigger</span><span>${fmt(g,2)}</span></div>
      <div class=bar><div style="width:${(g*100).toFixed(0)}%"></div></div>`;
 }
 function proprio(p){
   const j=p.joints||[], w=p.world||[]; let h='';
-  if(w.length===3) h+=`<div class=row><span>end effector world position (mm)</span><span>x ${fmt(w[0])} &nbsp; y ${fmt(w[1])} &nbsp; z ${fmt(w[2])}</span></div>`;
+  // Label on its own line above the value: the xyz triple is the widest thing here and
+  // side-by-side it set the whole card's minimum width.
+  if(w.length===3) h+=`<div class=stackrow><span class=k>end effector world position (mm)</span>`
+    +`<span class=v>x ${fmt(w[0])} &nbsp; y ${fmt(w[1])} &nbsp; z ${fmt(w[2])}</span></div>`;
   if(p.gripper!=null) h+=`<div class=row><span>gripper</span><span>${fmt(p.gripper,0)}</span></div>`;
   j.forEach((v,i)=>{ const f=Math.max(0,Math.min(1,(v+180)/360));
     h+=`<div class=row><span>Joint ${i+1}</span><span>${fmt(v)}&deg;</span></div>
@@ -1186,11 +1559,16 @@ async function openRun(name){
     if(el) wiggle(el); else toast(r.error||'could not open run'); return; }
   REP=r; camGrid(r.cameras.map(c=>c.label),true);
   r.cameras.forEach(c=>{ const v=document.getElementById('v_'+c.label); if(v){v.src=c.url;v.load();} });
-  modetxt.textContent=`${name} - ${fmt(r.duration_s)}s`;
+  modetxt.textContent=`${name} - ${fmt(r.duration_s)}s`
+    + (r.trimmed_s>0.05?` (trimmed ${fmt(r.trimmed_s)}s where a stream was missing)`:'');
   setTicker('PLAY BACK '+name,'blue');
   backlive.style.display=''; pbbar.classList.remove('off');
   DUR=Math.max(0.1,r.duration_s); SLIDER.updateOptions({range:{min:0,max:DUR}},true);
   T0=performance.now()/1000; PLAYING=true; pbtn.textContent='Pause';
+  // Actually start them. openRun set PLAYING=true but never called play(), so the
+  // panes held their first frame while the numbers advanced.
+  r.cameras.forEach(c=>{ const v=document.getElementById('v_'+c.label);
+    if(v){ v.currentTime=(c.skip||0); const p=v.play(); if(p&&p.catch) p.catch(()=>{}); } });
   requestAnimationFrame(tick);
 }
 function goLive(){ REP=null; PLAYING=false; backlive.style.display='none';
@@ -1207,9 +1585,12 @@ SLIDER=pbslider.noUiSlider;
 SLIDER.on('start',()=>{DRAG=true});
 SLIDER.on('slide',(v)=>{ const t=parseFloat(v[0]); T0=performance.now()/1000-t; apply(t); });
 SLIDER.on('end',()=>{DRAG=false});
-function stopPlay(){ if(!REP)return; PLAYING=false; pbtn.textContent='Play';
-  T0=performance.now()/1000; SLIDER.set(0); apply(0);
-  REP.cameras.forEach(c=>{const v=document.getElementById('v_'+c.label); if(v)v.pause();}); }
+function stopPlay(){ if(!REP)return;
+  // Stop means "done with this recording": pause the videos and hand the whole right
+  // panel back to the live feeds, rather than parking on frame 0 of a run.
+  PLAYING=false; pbtn.textContent='Play';
+  REP.cameras.forEach(c=>{const v=document.getElementById('v_'+c.label); if(v)v.pause();});
+  SLIDER.set(0); goLive(); }
 function at(rows,t){ if(!rows.length)return null; let lo=0,hi=rows.length-1;
   while(lo<hi){const m=(lo+hi)>>1; if(rows[m].t<t)lo=m+1; else hi=m;}
   const a=rows[Math.max(0,lo-1)],b=rows[lo];
@@ -1221,7 +1602,10 @@ function apply(t){
   if(ARM){ ARM.setJoints(p?p.j:[], 1-((c?(c.g??c.gripper):0)||0));
            if(p&&p.w&&p.w.length===3) ARM.setTarget(p.w,0); }
   REP.cameras.forEach(c=>{ const v=document.getElementById('v_'+c.label);
-    if(v&&isFinite(v.duration)){ const want=Math.max(0,t-(c.t0||0));
+    if(v&&isFinite(v.duration)){
+      // t is measured from the start of the COVERED window; each mp4 starts earlier,
+      // so skip into it by however much of it precedes that window.
+      const want=Math.max(0,t+(c.skip||0));
       if(Math.abs(v.currentTime-want)>0.15) v.currentTime=want; } });
 }
 function tick(){ if(!REP||!PLAYING)return; let t=performance.now()/1000-T0;

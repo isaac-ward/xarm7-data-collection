@@ -25,6 +25,7 @@ dependencies = [
 [project.scripts]
 swoosh-collect   = "swoosh_collect.collect:main"        # teleop + record
 swoosh-sanity    = "swoosh_collect.sanity:main"         # arm bring-up check
+swoosh-home      = "swoosh_collect.home:main"           # re-solve home from the box
 swoosh-cameras   = "swoosh_collect.cameras:main"        # discover + name cameras by USB path
 swoosh-campaign  = "swoosh_collect.campaign:main"       # create / list campaigns
 swoosh-summarize = "swoosh_collect.summarize:main"      # per-run summary mp4 + plots

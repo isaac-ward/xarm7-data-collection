@@ -86,10 +86,32 @@ def _process_run_async(run_dir: Path, cfg: dict, inflight: set) -> None:
     threading.Thread(target=work, daemon=True).start()
 
 
-def _clamp_to_box(xyz: np.ndarray, box: dict) -> tuple[np.ndarray, bool]:
+def _clamp_to_box(xyz: np.ndarray, box: dict,
+                  prev: np.ndarray | None = None) -> tuple[np.ndarray, bool]:
+    """Clamp the target into the box WITHOUT ever moving the arm by itself.
+
+    The obvious np.clip is wrong when the arm starts outside the box: it returns the
+    wall, and the servo then drives the whole excursion at once. That is a real jolt --
+    re-home left the EE at world y = -414.8 with the box allowing y >= -150, and the
+    first tick after streaming resumed commanded a 265 mm step.
+
+    Rate-limiting the approach was the next wrong answer: it still moves the arm
+    hundreds of millimetres with nobody touching the sticks.
+
+    So, per axis: never allow the violation to get WORSE, and never overshoot the wall
+    coming back. An axis already outside stays where it is until the operator drives it
+    in, and can never be pushed further out. Inside the box this is exactly np.clip.
+    """
     lo = np.array([box["x"][0], box["y"][0], box["z"][0]], dtype=np.float64)
     hi = np.array([box["x"][1], box["y"][1], box["z"][1]], dtype=np.float64)
-    out = np.clip(xyz, lo, hi)
+    if prev is None:
+        return np.clip(xyz, lo, hi), bool(np.any(np.clip(xyz, lo, hi) != xyz))
+    out = xyz.astype(np.float64).copy()
+    for i in range(3):
+        if out[i] < lo[i]:                      # below the floor
+            out[i] = min(max(out[i], prev[i]), lo[i])
+        elif out[i] > hi[i]:                    # above the ceiling
+            out[i] = max(min(out[i], prev[i]), hi[i])
     return out, bool(np.any(out != xyz))
 
 
@@ -166,15 +188,82 @@ def main() -> int:
     yaw_deg_s = float(get(cfg, "control.yaw_rate_deg_s", 60.0))
     box = dict(get(cfg, "control.workspace_box_mm"))
     dash_dt = 1.0 / max(float(get(cfg, "dashboard.refresh_hz", 15.0)), 1.0)
+    # Camera frames were published only inside the 15 Hz status branch, so a preview
+    # could never be fresher than 66 ms no matter how fast the browser asked. Publishing
+    # is just a reference swap under a short lock, so it can run at the cameras' own
+    # rate without touching the SSE rate.
+    frame_dt = 1.0 / max(float(get(cfg, "dashboard.preview_fps", 25.0)), 1.0)
+    last_frame_pub = 0.0
     state_every = max(1, int(rate / 50))  # poll the arm at ~50 Hz; the SDK read isn't free
 
     from scipy.spatial.transform import Rotation as R
 
+    mode_warned = False
+    last_recover = 0.0
+    slew_warned = False
+    preview_rig = None      # cameras run in preview whenever no run is recording
+
+    RigCls = SimulatedCameraRig if args.simulate else CameraRig
+
+    def start_preview():
+        """Live camera feeds with no recording, so the operator can see all four (and
+        check which is which) before pressing A. Cameras used to exist only for the
+        duration of a run, which left the dashboard's four panes permanently black."""
+        if args.no_cameras:
+            return None
+        try:
+            r = RigCls(cfg, server.campaign.path / ".preview", record=False)
+            # preview records no timestamps, so this origin is unused
+            r.start(time.monotonic(), blocking=False)
+            return r
+        except Exception as exc:
+            print(f"[collect] camera preview unavailable: {exc}", file=sys.stderr,
+                  flush=True)
+            return None
     R_home_world = R.from_matrix(
         R_WORLD_FROM_BASE @ R.from_euler("xyz", rpy_home, degrees=True).as_matrix()
     )
 
+    def warn_if_outside_box(where: str, w) -> None:
+        """A home pose outside the safety box is a configuration error, not something
+        to silently correct: the clamp would drag the arm to the wall as soon as
+        streaming starts."""
+        names = "xyz"
+        bad = []
+        for i, ax in enumerate(names):
+            lo, hi = float(box[ax][0]), float(box[ax][1])
+            v = float(w[i])
+            if not (lo <= v <= hi):
+                # Enough precision that the message cannot read as nonsense. At 0 dp a
+                # pose 0.04 mm over the wall printed as "x=650 outside [350, 650]",
+                # which looks like a bug in the check rather than a real excursion.
+                over = (v - hi) if v > hi else (lo - v)
+                bad.append(f"{ax}={v:.2f} outside [{lo:.0f}, {hi:.0f}] "
+                           f"by {over:.2f} mm")
+        if bad:
+            print(f"[collect] WARNING: {where} is OUTSIDE the workspace box "
+                  f"({'; '.join(bad)}). The arm will HOLD, not move itself -- jog back "
+                  f"in or fix the box; the box and the home pose disagree.",
+                  file=sys.stderr, flush=True)
+        return bool(bad)
+
+    # Seed from the real pose. Left as None, the first tick fell through to a plain
+    # np.clip and jumped straight to the wall -- which is the exact bug this guards.
+    prev_target = target_world.copy()
+    warn_if_outside_box("the starting pose", target_world)
+
     live = LiveState()
+    # Everything interesting the loop has to say goes to BOTH stdout and the
+    # dashboard's terminal panel. stdout alone is not good enough: the collector is
+    # usually started detached or under compose, where nobody is watching its console,
+    # and the operator's only window into the run is the browser.
+    def LOG(msg: str, err: bool = False) -> None:
+        print(msg, file=sys.stderr if err else sys.stdout, flush=True)
+        try:
+            server.sanity.log(msg)
+        except Exception:
+            pass          # the dashboard is a convenience; never let it break the loop
+
     live.preview = bool(args.simulate)     # the ticker says SIMULATED
     server = DashboardServer(
         cfg, campaign, live, port=int(get(cfg, "dashboard.port", 8770))
@@ -182,7 +271,8 @@ def main() -> int:
     server.arm_ref["arm"] = arm          # lets the sanity buttons talk to the arm
     url = server.start(open_browser=not args.no_browser)
     print(f"[collect] dashboard: {url}", flush=True)
-    print("[collect] A start   B stop   Y re-home   Start quit", flush=True)
+    print("[collect] A start   B stop   X clear errors   Y re-home   Start quit",
+          flush=True)
 
     rec: RunRecorder | None = None
     rig: CameraRig | None = None
@@ -201,6 +291,11 @@ def main() -> int:
 
     t_loop0 = time.monotonic()
     next_tick = t_loop0
+    preview_rig = start_preview()
+    LOG("[collect] A start   B stop   X clear errors   Y re-home   Start quit")
+    LOG(f"[collect] arm {arm.ip}   campaign {server.campaign.path.name}   "
+        f"box x{list(map(int, box['x']))} y{list(map(int, box['y']))} "
+        f"z{list(map(int, box['z']))}")
     tick = 0
 
     try:
@@ -223,19 +318,34 @@ def main() -> int:
                 box = nb
                 hint = "workspace box updated"
 
+            reanchored_tick = False
             snap = pad.snapshot(t)
+
+            # Every physical press is echoed, bound or not: an operator pressing an
+            # unbound button used to get complete silence, indistinguishable from a
+            # dead pad. This is logging only -- the arm is driven by drain_events().
+            for _tp, ecode, logical in pad.drain_presses():
+                if logical:
+                    LOG(f"[pad] {ecode} -> {logical}")
+                else:
+                    LOG(f"[pad] {ecode} (no binding)")
 
             # Physical pad presses and on-screen dashboard presses are the same
             # thing as far as the loop is concerned.
-            events = [b for _t, b in pad.drain_events()] + live.drain_buttons()
+            dash = live.drain_buttons()
+            for button in dash:
+                LOG(f"[dash] {button}")
+            events = [b for _t, b in pad.drain_events()] + dash
             for button in events:
                 if button == "quit":
                     hint = "quit pressed"
+                    LOG("[collect] Start -> quitting, arm holds position")
                     STOP.set()
 
                 elif button == "start_episode" and rec is None and inflight:
                     hint = (f"still processing {sorted(inflight)[0]} - "
                             f"wait for it to finish before starting another run")
+                    LOG(f"[collect] A ignored: {sorted(inflight)[0]} still processing")
 
                 elif button == "start_episode" and rec is None:
                     # Every episode is gated on the same cheap checks -- a one-shot
@@ -247,18 +357,29 @@ def main() -> int:
                                         inflight, last_state, simulate=args.simulate)
                     live.set_checks([{"name": c.name, "ok": c.ok, "detail": c.detail}
                                      for c in checks])
-                    if not report(checks):
+                    ok_all = report(checks)
+                    for c in checks:
+                        LOG(f"  [{'ok ' if c.ok else 'FAIL'}] {c.name}"
+                            + (f" -- {c.detail}" if c.detail else ""))
+                    if not ok_all:
                         hint = ("pre-run checks failed: "
                                 + next(c.name for c in checks if not c.ok))
+                        LOG("[collect] A REFUSED: pre-run checks failed", err=True)
                         next_tick = time.monotonic()
                         continue
                     # run.json is written immediately with status `recording`, so the
                     # dashboard lists the run the instant A is pressed.
-                    run_dir = campaign.new_run_dir()
+                    # via the server, so a campaign switched in the dashboard
+                    # actually takes effect here
+                    run_dir = server.campaign.new_run_dir()
                     rec = RunRecorder(run_dir, t0=t_loop0)
                     if not args.no_cameras:
-                        rig = (SimulatedCameraRig if args.simulate else CameraRig)(
-                            cfg, run_dir / "video")
+                        # Release the devices from preview first -- a camera cannot be
+                        # opened twice, so the recording rig would fail outright.
+                        if preview_rig is not None:
+                            preview_rig.stop()
+                            preview_rig = None
+                        rig = RigCls(cfg, run_dir / "video")
                         try:
                             # ONE CLOCK ORIGIN for every stream: t_loop0, not `now`.
                             # Passing the A-press time here gave cameras a different
@@ -274,6 +395,7 @@ def main() -> int:
                     # Blocking work just happened; don't let the loop burst-catch-up.
                     next_tick = time.monotonic()
                     hint = f"recording {run_dir.name}"
+                    LOG(f"[collect] A -> RECORDING {run_dir.name}")
 
                 elif button == "stop_episode" and rec is not None:
                     if rig is not None:
@@ -287,15 +409,23 @@ def main() -> int:
                     completed += 1
                     _process_run_async(run_dir, cfg, inflight)  # -> `processing` then `ready`
                     hint = f"saved {run_dir.name} ({meta['duration_s']:.1f}s) - processing"
+                    LOG(f"[collect] B -> saved {run_dir.name}, "
+                        f"{meta['duration_s']:.1f}s, now processing")
                     rec, rig, run_dir, run_started = None, None, None, None
+                    preview_rig = start_preview()   # feeds go live again
 
-                elif button == "rehome":
-                    if rec is not None:
-                        hint = "stop the run (B) before re-homing"
-                    else:
-                        hint = "re-homing"
-                        arm.go_home()
-                        arm.start_streaming()
+                elif button == "clear_errors" and rec is not None:
+                    # Re-home refuses mid-run; this must too. It re-seeds the target
+                    # AND resets yaw_world to 0, so pressing it during a recording
+                    # makes action.commanded_pose_world's yaw jump to 0 with no
+                    # physical change -- an unflagged discontinuity in the action.
+                    hint = "stop the run (B) before clearing errors"
+                    LOG("[collect] X refused: stop the run (B) first -- clearing "
+                        "re-seeds the target mid-episode", err=True)
+
+                elif button == "clear_errors":
+                    try:
+                        err, warn = arm.clear_errors()
                         target_world, base_pose = arm.current_pose_world()
                         rpy_home = list(base_pose[3:6])
                         R_home_world = R.from_matrix(
@@ -303,8 +433,55 @@ def main() -> int:
                             @ R.from_euler("xyz", rpy_home, degrees=True).as_matrix()
                         )
                         yaw_world = 0.0
+                        since_ok = None
+                        mode_warned = False
+                        prev_target = target_world.copy()
                         next_tick = time.monotonic()
-                        hint = "re-homed"
+                        hint = (f"cleared error {err} / warn {warn}" if (err or warn)
+                                else "nothing to clear - arm was healthy")
+                        LOG(f"[collect] X: cleared error={err} warn={warn}, servo "
+                            f"mode re-entered, target re-anchored")
+                    except Exception as exc:
+                        hint = f"clear FAILED: {exc}"
+                        LOG(f"[collect] clear FAILED: {exc}", err=True)
+
+                elif button == "rehome":
+                    if rec is not None:
+                        hint = "stop the run (B) before re-homing"
+                    else:
+                        hint = "re-homing"
+                        LOG("[collect] re-homing ...")
+                        try:
+                            # Y is deliberate and the operator's hand is on the pad,
+                            # so the full startup countdown is dead time here. Startup
+                            # homing keeps the 3 s banner, where nobody may be watching.
+                            arm.go_home(countdown=int(
+                                get(cfg, "arm.rehome_countdown_s", 1)))
+                            arm.start_streaming()
+                            target_world, base_pose = arm.current_pose_world()
+                            rpy_home = list(base_pose[3:6])
+                            R_home_world = R.from_matrix(
+                                R_WORLD_FROM_BASE
+                                @ R.from_euler("xyz", rpy_home, degrees=True).as_matrix()
+                            )
+                            yaw_world = 0.0
+                            since_ok = None
+                            prev_target = target_world.copy()
+                            next_tick = time.monotonic()
+                            if warn_if_outside_box("the home pose", target_world):
+                                hint = ("re-homed, but home is OUTSIDE the workspace "
+                                        "box - easing to the edge")
+                            else:
+                                hint = "re-homed"
+                            LOG(f"[collect] re-homed -> world "
+                                f"[{target_world[0]:.0f} {target_world[1]:.0f} "
+                                f"{target_world[2]:.0f}] mm, streaming resumed")
+                        except Exception as exc:
+                            # The enclosing try has no `except`, only `finally`, so a
+                            # raise here used to tear down the arm, the recorder and
+                            # the dashboard. Report it and keep the session alive.
+                            hint = f"re-home FAILED: {exc}"
+                            LOG(f"[collect] re-home FAILED: {exc}", err=True)
 
             # --- integrate the sticks into the desired pose -------------------
             target_world = target_world + np.array(
@@ -314,7 +491,24 @@ def main() -> int:
                     snap.height * v_mm_s * dt,
                 ]
             )
-            target_world, clamped = _clamp_to_box(target_world, box)
+            # `prev_target` is what makes the clamp incapable of moving the arm on its
+            # own: an axis outside the box holds until the OPERATOR drives it in.
+            target_world, clamped = _clamp_to_box(target_world, box, prev_target)
+            outside = float(np.linalg.norm(
+                target_world - np.clip(
+                    target_world,
+                    [box["x"][0], box["y"][0], box["z"][0]],
+                    [box["x"][1], box["y"][1], box["z"][1]])))
+            if outside > 1.0:
+                if not slew_warned:
+                    LOG(f"[collect] pose is {outside:.0f} mm OUTSIDE the workspace box. "
+                        f"Holding position -- jog back in, or fix the box. The arm will "
+                        f"not move itself.", err=True)
+                    slew_warned = True
+                hint = f"{outside:.0f} mm outside the box - jog back in"
+            else:
+                slew_warned = False
+            prev_target = target_world.copy()
             yaw_world += snap.yaw * yaw_deg_s * dt
 
             # Yaw is about the WORLD z axis, so it composes on the left in the world
@@ -332,6 +526,45 @@ def main() -> int:
             graw = arm.set_gripper(snap.gripper)
             if code == 1:
                 hint = "controller HAS_ERROR - stop and run swoosh-sanity"
+            # A servo command sent in mode 0 is ignored but STILL returns 0 (see
+            # arm.start_streaming), so `code` cannot detect it. Check the mode itself,
+            # cheaply, or the loop happily records actions for an arm that is frozen.
+            elif tick % state_every == 0 and not arm.streaming_ok():
+                # Something took the arm out of servo mode -- in practice a sanity task,
+                # which opens a second SDK session and ends with set_state(4). Teleop is
+                # dead until we re-enter mode 1, and set_servo_cartesian will keep
+                # returning 0 the whole time.
+                if rec is not None:
+                    # Mid-episode: do NOT auto-recover. A ~1 s recovery with a live
+                    # operator produces a startling jump, and the run is already
+                    # compromised -- say so and let them stop it deliberately.
+                    hint = "ARM NOT IN SERVO MODE - commands ignored - STOP THIS RUN (B)"
+                    if not mode_warned:
+                        LOG("[collect] WARNING: arm left servo mode MID-RUN; "
+                            "commands ignored -- STOP THIS RUN (B)", err=True)
+                        mode_warned = True
+                elif now - last_recover > 2.0:
+                    # Not recording, so recovery is free. Re-anchor the target to where
+                    # the arm actually is first, or it would lurch to a stale target the
+                    # instant streaming resumes.
+                    last_recover = now
+                    try:
+                        arm.start_streaming()
+                        target_world, base_pose = arm.current_pose_world()
+                        rpy_home = list(base_pose[3:6])
+                        R_home_world = R.from_matrix(
+                            R_WORLD_FROM_BASE
+                            @ R.from_euler("xyz", rpy_home, degrees=True).as_matrix()
+                        )
+                        yaw_world = 0.0
+                        since_ok = None
+                        prev_target = target_world.copy()
+                        next_tick = time.monotonic()
+                        hint = "servo mode recovered - teleop live again"
+                        LOG("[collect] servo mode recovered after an external "
+                            "takeover; target re-anchored")
+                    except Exception as exc:
+                        hint = f"ARM NOT IN SERVO MODE - recovery failed: {exc}"
 
             if tick % state_every == 0:
                 last_state = arm.read_state(t)
@@ -345,8 +578,10 @@ def main() -> int:
                         since_ok = since_ok or now
                         if now - since_ok > reanchor_after_s:
                             target_world = np.array(last_state.pose_world_xyz)
+                            prev_target = target_world.copy()
                             since_ok = None
                             reanchors += 1
+                            reanchored_tick = True
                             hint = f"target re-anchored ({lag_mm:.0f} mm behind)"
                     else:
                         since_ok = None
@@ -354,13 +589,24 @@ def main() -> int:
             if rec is not None:
                 rec.tick(t, dt, tick, code, snap.connected)
                 rec.controller(snap.as_row())
-                rec.commanded(t, target_world, rpy, yaw_world, snap.gripper, clamped)
-                rec.xarm_command(t, pose_base, code, graw)
+                rec.commanded(t, target_world, rpy, yaw_world, snap.gripper, clamped,
+                              reanchored=reanchored_tick)
+                rec.xarm_command(t, pose_base, code, graw,
+                                 gripper_sent=arm.gripper_command_record())
                 if last_state is not None and tick % state_every == 0:
                     rec.arm_state(last_state.as_row())
 
             # Hand the dashboard a snapshot: a dict copy under a short lock. Every
             # encode and socket write happens on server threads.
+            if now - last_frame_pub >= frame_dt:
+                last_frame_pub = now
+                feed = rig if rig is not None else preview_rig
+                if feed is not None:
+                    for cc in feed.caps:
+                        with cc.lock:
+                            if cc.latest is not None:
+                                live.put_frame(cc.label, cc.latest)
+
             if now - last_pub >= dash_dt:
                 last_pub = now
                 live.publish(
@@ -368,9 +614,20 @@ def main() -> int:
                         "move_x": snap.move_x, "move_y": snap.move_y,
                         "height": snap.height, "yaw": snap.yaw,
                         "gripper": snap.gripper, "connected": snap.connected,
+                        # Unbound axes are still worth SEEING -- the left trigger is
+                        # how you tell a dead pad from a pad you are not pressing.
+                        # snap.raw carries every axis pre-shaping.
+                        "raw": {k: round(float(v), 4)
+                                for k, v in (snap.raw or {}).items()},
                     },
                     proprio={
-                        "joints": (last_state.joints_deg if last_state else []),
+                        # MEASURED joints, not the controller's plan. The 3D view
+                        # renders these, and the two differ by up to ~10 deg while
+                        # moving -- which is why the rendered arm did not line up with
+                        # the real one. The plan is published alongside for comparison.
+                        "joints": ((last_state.joints_real_deg
+                                    or last_state.joints_deg) if last_state else []),
+                        "joints_planned": (last_state.joints_deg if last_state else []),
                         "world": (last_state.pose_world_xyz if last_state else []),
                         "gripper": (last_state.gripper_pos if last_state else None),
                         "error": (last_state.error_code if last_state else 0),
@@ -383,18 +640,24 @@ def main() -> int:
                         "run_index": int(run_dir.name.split("_")[1]) if run_dir else None,
                         "run_name": run_dir.name if run_dir else None,
                         "elapsed": (now - run_started) if run_started else 0.0,
-                        "cameras": [c["label"] for c in (rig.status() if rig else [])],
+                        "cameras": [c["label"] for c in
+                                    ((rig or preview_rig).status()
+                                     if (rig or preview_rig) else [])],
+                        # Full per-camera health, not just labels. A camera that failed
+                        # to open or died had no way of telling the operator: its pane
+                        # simply stayed black, which looks identical to "still warming
+                        # up". The dashboard now says which one and why.
+                        "camera_health": ((rig or preview_rig).status()
+                                          if (rig or preview_rig) else []),
                         "hint": hint,
                         "processing": sorted(inflight),
                         "preview": live.preview,
                     },
                 )
-                if rig is not None:
-                    for cc in rig.caps:
-                        with cc.lock:
-                            if cc.latest is not None:
-                                live.put_frame(cc.label, cc.latest)
+
     finally:
+        if preview_rig is not None:
+            preview_rig.stop()
         if rec is not None:
             if rig is not None:
                 rig.stop()
@@ -409,8 +672,8 @@ def main() -> int:
         time.sleep(0.3)
         server.stop()
 
-    print(f"\n[collect] done. {completed} run(s) in {campaign.path}")
-    print(f"[collect] export with:  swoosh-export --campaign {campaign.path.name}")
+    print(f"\n[collect] done. {completed} run(s) in {server.campaign.path}")
+    print(f"[collect] export with:  swoosh-export --campaign {server.campaign.path.name}")
     return 0
 
 

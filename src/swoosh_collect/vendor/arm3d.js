@@ -55,27 +55,91 @@ export async function createArmView(container, opts = {}) {
       geom.computeVertexNormals();
       g.add(new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
         color: i === 0 ? 0x9aa3ab : 0xe8ebee, metalness: 0.15, roughness: 0.6,
+        // Half-opaque so the workspace box, the target marker and the far side of the
+        // arm stay readable through it. depthWrite off stops the arm's own faces
+        // z-fighting into a muddle when they overlap.
+        transparent: true, opacity: 0.5, depthWrite: false,
       })));
     } catch (e) { /* a missing mesh should not kill the view */ }
     mountRoot.add(g); linkGroups.push(g);
   }
 
-  // link7 / flange group carries the gripper
+  // link7 / flange group carries the WRIST MESH and the gripper.
+  // manifest.json maps link7 -> end_tool.stl, and LINKS above stops at link6, so this
+  // mesh was never loaded: the arm visibly ended at link 6 and the gripper floated in
+  // the gap where the wrist belongs, looking detached. It shares the flange's frame
+  // (gripper_manifest's root attaches to link7 at zero offset), so it goes in here.
   const flange = new THREE.Group(); mountRoot.add(flange);
+  try {
+    const geom = await load('end_tool.stl');
+    geom.computeVertexNormals();
+    flange.add(new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
+      color: 0xe8ebee, metalness: 0.15, roughness: 0.6,
+      transparent: true, opacity: 0.5, depthWrite: false,
+    })));
+  } catch (e) { console.error('3D link7 (end_tool.stl) failed to load:', e); }
   let gripper = null;
   try {
     const manifest = await (await fetch(MESHES + 'gripper_manifest.json')).json();
     gripper = await buildGripper(THREE, loader, MESHES, manifest);
     flange.add(gripper.root);
-  } catch (e) { /* gripper optional */ }
+  } catch (e) {
+    // Was a silent swallow, which is how a missing base_link.stl went unnoticed:
+    // the gripper just never appeared, with nothing said anywhere.
+    console.error('3D gripper failed to build:', e);
+  }
 
   // ---- safety workspace, as a wireframe box -------------------------------
   let boxHelper = null;
+  let framedOnce = false;
   function setWorkspace(box) {
     if (boxHelper) { scene.remove(boxHelper); boxHelper.geometry.dispose(); }
     if (!box) return;
     const lo = new THREE.Vector3(box.x[0] / 1000, box.y[0] / 1000, box.z[0] / 1000);
     const hi = new THREE.Vector3(box.x[1] / 1000, box.y[1] / 1000, box.z[1] / 1000);
+    // Orbit about the box's centre IN PLAN, dropped to z = zmin -- so the view
+    // rotates around the middle of the work surface, on the surface, rather than
+    // around a point floating in mid air. Recomputed on every box change, which is
+    // why the workspace fields feel like they move the camera with them.
+    const mid = new THREE.Vector3(
+      (lo.x + hi.x) / 2,
+      (lo.y + hi.y) / 2,
+      lo.z,                       // the ground plane, not the box's vertical middle
+    );
+    if (framedOnce) {
+      // Keep whatever angle and zoom the operator has set; just move the pivot.
+      const offset = cam.position.clone().sub(controls.target);
+      controls.target.copy(mid);
+      cam.position.copy(mid).add(offset);
+    } else {
+      // First box: look at the work area from 30 degrees above the horizontal,
+      // keeping the established front-right azimuth. Elevation is set explicitly
+      // rather than inherited from the initial camera position, which sat at 21 deg.
+      // Look DOWN the world +X axis from 45 degrees above it. The camera therefore
+      // sits behind the origin in -X and above, so the view direction is +X.
+      // With cam.up = world +Z, three.js's basis puts screen-right at world -Y, which
+      // is what puts world +Y on the LEFT of the picture.
+      const ELEV = 45 * Math.PI / 180;
+      const dir = new THREE.Vector3(-Math.cos(ELEV), 0, Math.sin(ELEV));
+      // Far enough back to hold the whole box AND the arm's own base (the origin),
+      // which sits outside the box: take the bounding radius about the pivot and
+      // divide by tan(half-fov). Fixed multiples of the box diagonal framed too tight
+      // whenever the box did not contain the base.
+      const pts = [
+        new THREE.Vector3(lo.x, lo.y, lo.z), new THREE.Vector3(hi.x, hi.y, hi.z),
+        new THREE.Vector3(lo.x, hi.y, lo.z), new THREE.Vector3(hi.x, lo.y, hi.z),
+        new THREE.Vector3(lo.x, lo.y, hi.z), new THREE.Vector3(hi.x, hi.y, lo.z),
+        new THREE.Vector3(0, 0, 0),                        // the arm base
+      ];
+      let radius = 0;
+      for (const p of pts) radius = Math.max(radius, p.distanceTo(mid));
+      const halfFov = (cam.fov * Math.PI / 180) / 2;
+      const dist = Math.max(radius / Math.tan(halfFov) * 1.25, 0.8);
+      controls.target.copy(mid);
+      cam.position.copy(mid).add(dir.multiplyScalar(dist));
+      framedOnce = true;
+    }
+    controls.update();
     const b3 = new THREE.Box3(lo, hi);
     boxHelper = new THREE.Box3Helper(b3, new THREE.Color(0xd92d20));
     boxHelper.material.transparent = true; boxHelper.material.opacity = 0.75;

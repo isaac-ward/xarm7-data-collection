@@ -38,15 +38,42 @@ def slugify(name: str) -> str:
     return s
 
 
-def campaigns_root(cfg: dict[str, Any] | None = None) -> Path:
-    cfg = cfg or load_config()
-    # Relative to the repo root (the dir holding pyproject.toml), so it lands in the
-    # gitignored campaigns/ no matter where the command is run from.
+def repo_root() -> Path:
+    """The dir holding pyproject.toml. Inside the container this is /workspace."""
     here = Path(__file__).resolve()
-    root = next(
+    return next(
         (p for p in here.parents if (p / "pyproject.toml").is_file()), Path.cwd()
     )
-    return root / str(get(cfg, "recording.campaigns_dir", "campaigns"))
+
+
+def host_view(path: Path | str) -> str:
+    """Rewrite a container path to the equivalent HOST path, for DISPLAY ONLY.
+
+    compose bind-mounts the host repo at /workspace and passes the host-side dir as
+    SWOOSH_HOST_ROOT. "/workspace/campaigns" is meaningless to an operator reading the
+    dashboard on the host and cannot be pasted into a file manager, so anything shown
+    to a human goes through here. Never use the result to open a file -- the process
+    is inside the container and only the container path resolves.
+    """
+    import os
+
+    s = str(path)
+    host_root = os.environ.get("SWOOSH_HOST_ROOT", "").rstrip("/")
+    if not host_root:
+        return s
+    container_root = str(repo_root()).rstrip("/")
+    if s == container_root:
+        return host_root
+    if s.startswith(container_root + "/"):
+        return host_root + s[len(container_root):]
+    return s
+
+
+def campaigns_root(cfg: dict[str, Any] | None = None) -> Path:
+    cfg = cfg or load_config()
+    # Relative to the repo root, so it lands in the gitignored campaigns/ no matter
+    # where the command is run from.
+    return repo_root() / str(get(cfg, "recording.campaigns_dir", "campaigns"))
 
 
 @dataclass

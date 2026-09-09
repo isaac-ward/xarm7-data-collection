@@ -1,8 +1,8 @@
 """xArm7 forward kinematics and a small numerical IK.
 
-The FK table here is the SAME modified-DH table as `vendor/armfk.js`; the two are
-cross-checked against each other in tests/test_kinematics.py so the 3D view and the
-simulator cannot drift apart.
+The chain here is the SAME chain as `vendor/armfk.js`; the two are cross-checked against
+each other in tests/test_kinematics.py so the 3D view and the simulator cannot drift
+apart.
 
 WHAT THIS IS AND IS NOT FOR. The real robot's IK lives in the xArm controller --
 `set_servo_cartesian` hands it a Cartesian pose and the controller solves it. Nothing
@@ -11,32 +11,44 @@ here is used to command the real arm. This exists so that:
   * the dashboard's FK-check button can compare FK(joints) against the pose the
     controller itself reports, which is the only way to confirm the table is right.
 
-UNTIL THAT CHECK PASSES ON THE ROBOT, TREAT THE TABLE AS UNVERIFIED.
+CHECKED ON THE ROBOT 2026-09-08: this chain's flange sits 2.5 mm from the pose the
+controller itself reports, at a pose far from home. The modified-DH table this replaced
+was 28.0 mm out -- it had the link twists of joints 6 and 7 swapped, which left the
+wrist mis-rotated in the 3D view.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-# alpha_{i-1}, a_{i-1}, d_i   (radians, metres) -- UFACTORY's published xArm7 table
-DH = np.array([
-    [0.0,          0.0,     0.267],
-    [-np.pi / 2,   0.0,     0.0],
-    [np.pi / 2,    0.0,     0.293],
-    [np.pi / 2,    0.0525,  0.0],
-    [np.pi / 2,    0.0775,  0.3425],
-    [-np.pi / 2,   0.0,     0.0],
-    [np.pi / 2,    0.076,   0.097],
+# Straight out of mujoco_menagerie `ufactory_xarm7` (xarm7_nohand.xml) -- the same model
+# the vendored STL meshes come from, so geometry and rendering cannot disagree. Each row
+# is a body: offset by `pos`, apply the body's fixed +/-90 deg twist about X, then rotate
+# about the joint's own axis (MuJoCo's default, +Z).
+#
+#   T_i = T_{i-1} @ Translate(pos) @ Rx(twist) @ Rz(theta_i)
+#
+# The MJCF's 0.12 m pedestal under link_base is deliberately excluded: the controller's
+# base frame is the mounting flange, and get_position reports in that frame.
+# pos_x, pos_y, pos_z (metres), twist about X (radians)
+CHAIN = np.array([
+    [0.0,     0.0,     0.267,  0.0],          # link1
+    [0.0,     0.0,     0.0,   -np.pi / 2],    # link2
+    [0.0,    -0.293,   0.0,    np.pi / 2],    # link3
+    [0.0525,  0.0,     0.0,    np.pi / 2],    # link4
+    [0.0775, -0.3425,  0.0,    np.pi / 2],    # link5
+    [0.0,     0.0,     0.0,    np.pi / 2],    # link6
+    [0.076,   0.097,   0.0,   -np.pi / 2],    # link7 / flange
 ], dtype=np.float64)
 
 
-def _link(alpha: float, a: float, d: float, theta: float) -> np.ndarray:
-    ca, sa = np.cos(alpha), np.sin(alpha)
+def _link(pos, twist: float, theta: float) -> np.ndarray:
+    ca, sa = np.cos(twist), np.sin(twist)
     ct, st = np.cos(theta), np.sin(theta)
     return np.array([
-        [ct,      -st,      0.0,  a],
-        [st * ca,  ct * ca, -sa, -d * sa],
-        [st * sa,  ct * sa,  ca,  d * ca],
+        [ct,      -st,      0.0, pos[0]],
+        [ca * st,  ca * ct, -sa, pos[1]],
+        [sa * st,  sa * ct,  ca, pos[2]],
         [0.0,      0.0,      0.0, 1.0],
     ])
 
@@ -47,7 +59,7 @@ def fk_chain(joints_deg) -> list[np.ndarray]:
     out = [np.eye(4)]
     T = out[0]
     for i in range(7):
-        T = T @ _link(DH[i, 0], DH[i, 1], DH[i, 2], q[i])
+        T = T @ _link(CHAIN[i, :3], CHAIN[i, 3], q[i])
         out.append(T)
     return out
 

@@ -1,30 +1,34 @@
-"""FK sanity, and the Python table must equal the JavaScript one.
+"""FK sanity, and the Python chain must equal the JavaScript one.
 
-The 3D view uses vendor/armfk.js and the simulator uses kinematics.py. If the two
-tables ever drift apart, the 3D scene stops showing what the simulator thinks the arm
-is doing -- so compare them literally.
+The 3D view uses vendor/armfk.js and the simulator uses kinematics.py. If the two ever
+drift apart, the 3D scene stops showing what the simulator thinks the arm is doing -- so
+compare them literally. This test earned its keep: it caught the JS side being ported to
+the MJCF chain while Python still held the old (28 mm wrong) DH table.
 """
 import re, sys, pathlib
 import numpy as np
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from swoosh_collect.kinematics import DH, fk_chain, fk_pose_mm, ik_position
+from swoosh_collect.kinematics import CHAIN, fk_chain, fk_pose_mm, ik_position
 
 
-def test_js_and_python_tables_match():
+def test_js_and_python_chains_match():
+    """Parse the CHAIN literal out of armfk.js and compare it to the Python one.
+
+    JS carries the twist in DEGREES for readability; Python in radians. Compare in
+    degrees so the units are explicit rather than assumed.
+    """
     js = (ROOT / "src/swoosh_collect/vendor/armfk.js").read_text()
-    body = js[js.index("export const DH"): js.index("];", js.index("export const DH"))]
-    rows = re.findall(r"\[\s*([^,\]]+),\s*([^,\]]+),\s*([^,\]]+)\s*\]", body)
-    assert len(rows) == 7, f"parsed {len(rows)} rows from armfk.js"
-    ev = {"Math.PI": np.pi, "-Math.PI": -np.pi}
-    def num(t):
-        t = t.strip()
-        if "Math.PI" in t:
-            sign = -1.0 if t.startswith("-") else 1.0
-            return sign * np.pi / float(t.split("/")[1]) if "/" in t else sign * np.pi
-        return float(t)
-    js_dh = np.array([[num(a), num(b), num(c)] for a, b, c in rows])
-    assert np.abs(js_dh - DH).max() < 1e-12, f"tables differ:\n{js_dh}\nvs\n{DH}"
+    start = js.index("export const CHAIN")
+    body = js[start: js.index("];", start)]
+    rows = re.findall(
+        r"pos:\s*\[\s*([-\d.]+)\s*,\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\]\s*,"
+        r"\s*twist:\s*([-+\d.]+)", body)
+    assert len(rows) == 7, f"parsed {len(rows)} rows from armfk.js CHAIN"
+    js_chain = np.array([[float(a), float(b), float(c), float(t)] for a, b, c, t in rows])
+    py_chain = np.column_stack([CHAIN[:, :3], np.degrees(CHAIN[:, 3])])
+    assert np.abs(js_chain - py_chain).max() < 1e-9, (
+        f"chains differ:\nJS:\n{js_chain}\nPython:\n{py_chain}")
 
 
 def test_zero_pose_folds_down_near_the_base():

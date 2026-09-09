@@ -88,7 +88,8 @@ class SimulatedArm:
             self._pose = np.array([330.0, 0.0, 621.0, 180.0, 0.0, 0.0])
             self._target = self._pose.copy()
 
-    def start_streaming(self) -> None: ...
+    def start_streaming(self, timeout_s: float = 3.0) -> None: ...
+    def streaming_ok(self) -> bool: return True   # simulated arm never drops mode
     def start_gripper_worker(self) -> None: ...
 
     def shutdown(self) -> None:
@@ -157,6 +158,9 @@ class SimulatedPad:
 
     def drain_events(self) -> list[tuple[float, str]]:
         return []                 # the dashboard's A/B/Y are the only button source
+
+    def drain_presses(self) -> list[tuple[float, str, str | None]]:
+        return []                 # same: no physical pad to press
 
     def snapshot(self, t: float) -> PadSnapshot:
         if self.idle:
@@ -250,9 +254,10 @@ class SimulatedCameraRig:
     """Writes real mp4s and real timestamp files, so a simulated episode is a real
     run folder that summarises, plays back and exports like any other."""
 
-    def __init__(self, cfg: dict[str, Any], out_dir: Path) -> None:
+    def __init__(self, cfg: dict[str, Any], out_dir: Path, record: bool = True) -> None:
         self.cfg = cfg
         self.out_dir = out_dir
+        self.record = record
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.stop_event = threading.Event()
         self.caps: list[_SimCap] = []

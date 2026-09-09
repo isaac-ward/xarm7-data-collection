@@ -38,6 +38,11 @@ RUN uv pip install --python /opt/venv/bin/python -e .
 RUN printf 'export PATH="/opt/venv/bin:$PATH"\nexport VIRTUAL_ENV=/opt/venv\n' \
       > /etc/profile.d/10-venv.sh
 
+# The repo is bind-mounted from a uid-1000 host into a uid-0 container, so git
+# refuses it as "dubious ownership" -- which made provenance record git_sha "unknown"
+# and git_dirty False for EVERY run, i.e. no provenance at all, silently.
+RUN git config --global --add safe.directory /workspace
+
 COPY docker/entrypoint.bash /entrypoint.bash
 RUN chmod +x /entrypoint.bash
 ENTRYPOINT ["/entrypoint.bash"]

@@ -24,18 +24,53 @@ arm:
   # WITH THIS AT 0, REAL COLLISIONS ARE NOT CAUGHT. Clear the workspace.
   collision_sensitivity: 0
 
-  # Right-arm home, degrees, 7 joints. From manipulation-mono's starting_poses.right.
-  # TCP lands around (330, 0, 621) mm so EE teleop has headroom in every direction.
-  # All-zeros is NOT safe -- J4=0 fully extends the elbow into the base.
-  home_joints: [4, -37, -3, 49, -7, 16, -40]
-  home_speed_deg_s: 20.0
-  home_acc_deg_s2: 100.0
+  # Right-arm home, degrees, 7 joints. Solved 2026-09-08 so the EE sits at the
+  # workspace box's PLAN CENTRE, 50 mm below its z ceiling, gripper approaching at
+  # 45 deg below horizontal with the PINCERS FACING LEFT (+Y) -- the forward-facing
+  # frame rotated 90 deg about world Z:
+  #   world (501.3, 21.6, 349.6) mm, approach (0.00, +0.709, -0.705)
+  #   = 44.8 deg below horizontal, pointing +Y
+  #   vs box x[350,650] y[-150,200] z[0,400]
+  # INSIDE THE BOX ON PURPOSE. The previous home was at world y = -414.8 while the box
+  # allowed y >= -150, so the first clamp after re-homing commanded a 265 mm step and
+  # the arm jolted hard enough to need an emergency stop. The clamp can no longer do
+  # that (see _clamp_to_box), but a home outside its own safety box is still wrong.
+  # Solved with the controller's IK, confirmed with our MJCF chain to 3.6 mm.
+  # All-zeros is NOT safe -- J4=0 fully extends the elbow into the base. Beware also
+  # that api.angles reads all-zeros for ~100 ms after connect, and returns zeros
+  # indefinitely while the E-stop is engaged; use arm.joints_now(), which waits.
+  home_joints:
+  - -98.8
+  - -55.6
+  - 109.8
+  - 79.9
+  - 57.0
+  - 68.1
+  - 84.2
+  home_speed_deg_s: 60.0
+  home_acc_deg_s2: 500.0
 
   # set_servo_cartesian shaping. The controller picks its own internal interpolation
   # at streaming rate, but these are passed to avoid surprises.
   speed_mm_s: 200.0
   acc_mm_s2: 2000.0
 
+  # Y is operator-initiated with their hand on the pad, so the full 3 s banner is
+  # dead time. Startup homing still uses 3 s, where nobody may be watching the arm.
+  # SAFETY: this is your reaction window. Raise it if the arm is ever left unattended.
+  rehome_countdown_s: 1
+  # WHAT THE HOME POSE MEANS, so it can be re-solved whenever the workspace box moves.
+  # home_joints below is the SOLUTION; this is the intent it was solved from. Re-derive
+  # with `swoosh-home --solve` after changing the box -- a frozen joint list silently
+  # disagreeing with the box is what produced a 265 mm jolt and an emergency stop.
+  #   below_ceiling_mm             how far under z-max the EE sits
+  #   approach_below_horizontal    tilt of the gripper's approach axis
+  #   approach_azimuth_deg         0 = +X (forward), 90 = +Y (left)
+  # The position is always the box's centre in plan.
+  home_intent:
+    below_ceiling_mm: 50.0
+    approach_below_horizontal_deg: 45.0
+    approach_azimuth_deg: 90.0
 gripper:
   # Standard xArm gripper travel -- the same gripper as manipulation-mono (confirmed
   # by Isaac 2026-09-09). Proportional: trigger 0..1 maps linearly onto open..closed.
@@ -50,6 +85,12 @@ gripper:
   # modbus device and flooding it backs its worker queue up.
   min_command_delta: 15
 
+  # How often to read the gripper's position back. Each read is two modbus round
+  # trips on the SAME SDK lock the 100 Hz servo command needs, so this trades gripper
+  # column freshness against control-loop jitter. Was hardcoded at 10 Hz, which made
+  # observation.state's gripper 80% sample-and-hold at 50 Hz. Raised to 20; check
+  # `loop timing` in swoosh-validate after changing it, and back off if ticks overrun.
+  poll_hz: 20.0
 control:
   rate_hz: 100.0                 # xArm's recommended set_servo_cartesian rate
 
@@ -72,26 +113,30 @@ control:
   # on the other axes continues. Editable live from the dashboard's 3D scene panel.
   workspace_box_mm:
     x:
-    - 150.0
+    - 350.0
     - 700.0
     y:
-    - -450.0
-    - 450.0
+    - -250.0
+    - 150.0
     z:
-    - 50.0
-    - 700.0
+    - 0.0
+    - 400.0
 controller:
   # Wired Xbox pad. Matched by device NAME, not a fixed /dev/input/eventN, because
   # the number moves between boots and replugs.
-  name_match: "Xbox"
+  name_match: "x-box"
   buttons:
     start_episode: "BTN_SOUTH"   # A
     stop_episode: "BTN_EAST"     # B
     # EVDEV NAMING TRAP: BTN_NORTH is the physical X (0x133); BTN_WEST is the
-    # physical Y (0x134). Binding rehome to BTN_NORTH put it on X -- the button
-    # meant to stay unbound. Verified against evdev 2.0.0 on this machine.
+    # physical Y (0x134). Binding rehome to BTN_NORTH put it on X. Confirmed on
+    # the real pad 2026-09-08: A,B,Y,X,Start -> SOUTH,EAST,WEST,NORTH,START.
     rehome: "BTN_WEST"           # Y, behind the motion countdown
     quit: "BTN_START"            # Start -> clean shutdown, arm holds position
+    # X -- clears latched errors AND warnings, then re-enters servo mode and
+    # re-anchors the target. Clearing alone leaves the controller out of mode 1,
+    # where set_servo_cartesian is ignored but still returns 0.
+    clear_errors: "BTN_NORTH"    # X
   axes:
     move_x: "ABS_Y"              # left stick vertical    -> world +X forward
     move_y: "ABS_X"              # left stick horizontal  -> world +Y left
@@ -107,7 +152,7 @@ controller:
 
 cameras:
   # Discovered from /sys/class/video4linux/*/name, one entry per physical USB device.
-  name_filter: "Arducam"
+  name_filter: "Innomaker"
   fps: 30.0                      # MJPG sustains 30+; YUYV would cap at 5-10
   width: 640
   height: 480
@@ -120,10 +165,19 @@ cameras:
   mp4_quality: 8
   # Label <-> USB port path, written by the dashboard's "name cameras" button. Pinned
   # by PATH so labels survive reboots and replugs; enumeration order does not.
-  by_usb_path: {}
-  # The four we expect. This order is the order they appear in the summary MP4 grid.
+  by_usb_path:
+    4-4.4.1: scene_left
+    4-4.3: scene_right
+    4-4.4.4.2: gripper_right_bottom
+    4-4.4.4.1: gripper_right_top
   expected_labels: ["scene_left", "scene_right", "gripper_right_bottom", "gripper_right_top"]
-
+  # Labels whose frames are flipped VERTICALLY the instant they come off the device,
+  # before anything sees them: the mp4, the frame timestamps, the dashboard preview and
+  # the LeRobot export all get the flipped image, so there is exactly one orientation
+  # in existence and no consumer has to know. gripper_right_top is mounted inverted.
+  # Recorded per run in *_frame_times.json ("flipped_vertical") so the dataset says so.
+  flip_vertical:
+  - 4-4.4.4.2
 recording:
   # Raw streams are the authoritative record: every stream at its own native rate on
   # ONE monotonic clock. The 30 Hz LeRobot export is DERIVED from them, so a wrong
@@ -134,6 +188,23 @@ recording:
   # "choose root folder" button.
   campaigns_dir: "campaigns"
 
+  # Smallest fraction of a recorded run that must be covered by EVERY stream for the
+  # export to accept it. The 30 Hz grid spans only the window where all streams
+  # (cameras included) have data, so a camera that dies part-way silently shortens the
+  # episode -- lego_assemblies threw away 46% of its frames and nobody noticed, because
+  # the retained fraction was never printed. It is printed on every export now, and
+  # anything below this is refused rather than emitted as complete.
+  min_coverage: 0.9
+  # Seconds of head/tail loss to expect for free: the camera rig opens on a worker
+  # with open_stagger_sec per camera plus warmup_frames, so video legitimately starts
+  # after the control loop. Loss BEYOND this (or beyond min_coverage of the run,
+  # whichever is larger) is what gets a run refused.
+  coverage_allowance_s: 2.5
 dashboard:
   refresh_hz: 15.0
   port: 8770
+  # Camera preview publish rate. Frames used to be handed to the dashboard only
+  # inside the refresh_hz status branch, capping preview freshness at 66 ms however
+  # fast the browser asked. Publishing is a reference swap under a short lock, so it
+  # is cheap; the JPEG encode still happens on server threads, never the servo loop.
+  preview_fps: 25.0

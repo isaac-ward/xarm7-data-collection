@@ -41,16 +41,26 @@ def git_sha() -> str:
         return "unknown"
 
 
-def git_dirty() -> bool:
+def git_dirty() -> bool | None:
+    """True/False, or None when git could not be consulted.
+
+    This returned False on failure, which reads as "the tree was clean" -- the most
+    reassuring possible answer to a question we did not actually get to ask. Inside the
+    container git refused the bind-mounted repo as dubious ownership, so every run
+    recorded git_sha "unknown" alongside git_dirty False, i.e. no provenance while
+    looking like good provenance.
+    """
     try:
-        out = subprocess.run(
+        r = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=Path(__file__).resolve().parents[2], capture_output=True,
             text=True, timeout=5,
-        ).stdout.strip()
-        return bool(out)
+        )
+        if r.returncode != 0:
+            return None
+        return bool(r.stdout.strip())
     except Exception:
-        return False
+        return None
 
 
 def _verify_path() -> Path:
