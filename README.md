@@ -7,6 +7,8 @@ Hardware facts (arm IP, NIC, home pose, camera settings, the SDK pin) are carrie
 from [`sisl/manipulation-mono`](https://github.com/sisl/manipulation-mono). No ROS: the
 Quest stack needed it, an Xbox pad does not.
 
+**Picking this up fresh?** Start with [docs/handoff_2026_09_09.md](docs/handoff_2026_09_09.md) — current state, the three gates, and the traps worth knowing before changing anything.
+
 ---
 
 ## Starting a new campaign
