@@ -117,7 +117,10 @@ def _clamp_to_box(xyz: np.ndarray, box: dict,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Xbox teleop + data collection, right arm.")
-    ap.add_argument("--campaign", required=True, help="campaign name (see swoosh-campaign)")
+    ap.add_argument("--campaign", default=None,
+                    help="campaign name; defaults to the most recently created one, "
+                         "because starting in whichever campaign was named first is "
+                         "how runs end up in the wrong place (see swoosh-campaign)")
     ap.add_argument("--config", type=Path, default=None)
     ap.add_argument("--no-cameras", action="store_true", help="teleop without recording video")
     ap.add_argument("--no-home", action="store_true", help="skip the initial re-home")
@@ -132,7 +135,16 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    campaign = Campaign.open(args.campaign, cfg)
+    if args.campaign:
+        campaign = Campaign.open(args.campaign, cfg)
+    else:
+        campaign = Campaign.latest(cfg)
+        if campaign is None:
+            print("[collect] no campaigns yet. Create one with:\n"
+                  '  swoosh-campaign new "my campaign"', file=sys.stderr)
+            return 2
+        print(f"[collect] campaign: {campaign.path.name} (most recent; "
+              f"pass --campaign to choose another)", flush=True)
 
     # A wrong frame matrix mislabels every action in the campaign and is unrecoverable
     # afterwards, so refuse by default rather than discover it in training.
@@ -264,7 +276,14 @@ def main() -> int:
         except Exception:
             pass          # the dashboard is a convenience; never let it break the loop
 
-    live.preview = bool(args.simulate)     # the ticker says SIMULATED
+    # SIMULATED is now a read-only fact about how the process was started, not a mode
+    # anything can switch into. The dashboard used to carry a "preview mode" button
+    # that flipped this flag -- which changed the ticker and nothing else, since the
+    # arm, pad and cameras are already-constructed real objects by this point. A
+    # control that misreports the mode without changing it is worse than no control.
+    live.preview = bool(args.simulate)
+    assert not (live.preview and not args.simulate), (
+        "SIMULATED must only ever be set by --simulate")
     server = DashboardServer(
         cfg, campaign, live, port=int(get(cfg, "dashboard.port", 8770))
     )
@@ -290,6 +309,7 @@ def main() -> int:
     completed = len([r for r in campaign.runs() if r.complete])
 
     t_loop0 = time.monotonic()
+    arm.set_clock_origin(t_loop0)     # so the arm's own stamps share this clock
     next_tick = t_loop0
     preview_rig = start_preview()
     LOG("[collect] A start   B stop   X clear errors   Y re-home   Start quit")
@@ -398,6 +418,13 @@ def main() -> int:
                     LOG(f"[collect] A -> RECORDING {run_dir.name}")
 
                 elif button == "stop_episode" and rec is not None:
+                    # Mark it stopped BEFORE any of the teardown work, so the tag
+                    # flips the moment B is pressed rather than after the cameras
+                    # have closed and the summariser has spawned.
+                    if run_dir is not None:
+                        set_run_status(run_dir, "stopped")
+                    live.bump()
+                    LOG("[collect] B -> stopped, closing streams")
                     if rig is not None:
                         rig.stop()
                         rig.write_timestamps()

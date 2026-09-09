@@ -36,8 +36,10 @@ class ArmState:
     # False when the controller's report stream has gone silent (E-stop, link drop),
     # in which case api.angles reads all-zeros and any pose is suspect
     report_alive: bool = True
-    # when gripper_pos was measured, NOT when this row was built (see the worker)
+    # when gripper_pos was measured, on the SAME clock as `t` (see read_state)
     gripper_pos_t: float = float("nan")
+    # how old that reading was when this row was built, in seconds
+    gripper_pos_age_s: float = float("nan")
     pose_base: list[float] = field(default_factory=list)    # [x,y,z,r,p,y] mm/deg
     pose_world_xyz: list[float] = field(default_factory=list)
     gripper_pos: float = float("nan")
@@ -56,6 +58,7 @@ class ArmState:
             "pose_world_xyz_mm": self.pose_world_xyz,
             "gripper_pos": self.gripper_pos,
             "gripper_pos_t": self.gripper_pos_t,
+            "gripper_pos_age_s": self.gripper_pos_age_s,
             "state": self.state,
             "mode": self.mode,
             "error_code": self.error_code,
@@ -89,6 +92,7 @@ class RightArm:
         self._grip_sent_code: int = 0
         self._grip_sent_err: str = ""
         self._grip_suspended: bool = False
+        self._clock_origin: float = 0.0   # set by set_clock_origin()
         self._grip_poll_period: float = 1.0 / max(
             1.0, float(get(self.cfg, "gripper.poll_hz", 20.0)))
         self._grip_lock = threading.Lock()
@@ -385,7 +389,24 @@ class RightArm:
             st.report_alive = False
         with self._grip_lock:      # cached by the worker; never block the loop on modbus
             st.gripper_pos = self._grip_pos
-            st.gripper_pos_t = self._grip_pos_t
+            # EPOCH. The worker stamps with absolute time.monotonic(); every `t` in a
+            # run is relative to t_loop0, and the arm does not know t_loop0. Writing
+            # the absolute stamp put gripper_pos_t 61,615 s away from every other
+            # timestamp in the file, so the export resampled the gripper against a
+            # clock it shared nothing with. Convert to an AGE here -- valid because
+            # both sides are absolute -- then express it on the row's own clock.
+            gp_t = self._grip_pos_t
+        if gp_t == gp_t:                                # not NaN
+            # Exact, via the run's clock origin. Reconstructing it as
+            # `t - (monotonic() - gp_t)` was on the right clock but jittered a couple
+            # of ms, because `t` and monotonic() are read at slightly different
+            # instants -- so a value held between 20 Hz polls was never bit-identical
+            # and the held-fraction check read the rate as 50 Hz.
+            st.gripper_pos_t = gp_t - self._clock_origin
+            st.gripper_pos_age_s = t - st.gripper_pos_t
+        else:
+            st.gripper_pos_age_s = float("nan")
+            st.gripper_pos_t = float("nan")
         for attr, name in ((("state",), "state"), (("mode",), "mode")):
             try:
                 setattr(st, name, int(getattr(self.api, attr[0], -1)))
@@ -419,15 +440,32 @@ class RightArm:
             return None
 
     def gripper_command_record(self) -> dict:
-        """What the gripper worker last actually SENT, not what was queued."""
+        """What the gripper worker last actually SENT, not what was queued.
+
+        `sent_age_s` rather than a timestamp, for the same epoch reason as
+        gripper_pos_t: the worker's clock is absolute and the recorder's is relative to
+        t_loop0. An age is meaningful without knowing either epoch, and the recorder
+        turns it back into a time on the row's own clock.
+        """
         with self._grip_lock:
-            return {
+            t_sent = self._grip_sent_t
+            rec = {
                 "sent_position": (None if self._grip_sent is None
                                   else float(self._grip_sent)),
-                "sent_t": float(self._grip_sent_t),
                 "sent_code": int(self._grip_sent_code),
                 "sent_error": self._grip_sent_err,
             }
+        rec["sent_t"] = (t_sent - self._clock_origin) if t_sent == t_sent else None
+        return rec
+
+    def set_clock_origin(self, t0: float) -> None:
+        """Tell the arm the run's t_loop0, so its own stamps land on the shared clock.
+
+        Without it the arm only has absolute time.monotonic() and every timestamp it
+        produced had to be reconstructed by the caller -- which is how gripper_pos_t
+        ended up 61,615 s adrift, and later merely jittery.
+        """
+        self._clock_origin = float(t0)
 
     def gripper_suspend(self, on: bool) -> None:
         """Stop the control loop from overwriting someone else's gripper command.

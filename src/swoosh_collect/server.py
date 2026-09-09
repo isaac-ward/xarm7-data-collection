@@ -180,10 +180,14 @@ class LiveState:
             b, self.workspace = self.workspace, None
             return b
 
-    def toggle_preview(self) -> bool:
+    def bump(self) -> None:
+        """Force the next SSE frame out immediately.
+
+        The run list polls /api/campaign every 4 s, so a status change could sit
+        invisible for that long -- which made B look like it had not registered.
+        """
         with self._lock:
-            self.preview = not self.preview
-            return self.preview
+            self.seq += 1
 
     def set_checks(self, checks: list[dict]) -> None:
         with self._lock:
@@ -421,11 +425,6 @@ class Handler(BaseHTTPRequestHandler):
         elif action == "validate":
             ok = self.sanity.start(action, [py, "-m", "swoosh_collect.validate",
                                             "--campaign", self.campaign.path.name])
-        elif action == "preview":
-            on = self.live.toggle_preview()
-            self.sanity.log(f"preview mode {'ON - synthetic data, no hardware' if on else 'OFF'}")
-            self._json({"ok": True, "preview": on})
-            return
         elif action in jobs:
             ok = self.sanity.start(action, jobs[action])
         else:
@@ -483,18 +482,19 @@ class Handler(BaseHTTPRequestHandler):
         if best_lag is not None:
             save_measurement("servo_lag_ms", {"lag_ms": best_lag, "residual_mm": best,
                                               "run": r.path.name})
-            log(f"saved servo_lag_ms = {best_lag} into campaigns/.measurements.json")
+            log(f"  recorded servo_lag_ms = {best_lag} in campaigns/.measurements.json")
         if best_lag is None:
             log("no usable samples")
         elif best_lag in (0, 400):
-            log(f"WARNING: minimum at the EDGE of the sweep ({best_lag} ms, {best:.2f} mm).")
             log("A correct action stream gives a U with the minimum INSIDE the range.")
             log("A flat or edge-pinned curve is the lego_assemblies misalignment signature.")
+            log(f"RESULT  servo lag INDETERMINATE -- minimum at the sweep EDGE "
+                f"({best_lag} ms, {best:.2f} mm)")
         else:
-            log(f"OK: minimum {best:.2f} mm at {best_lag} ms -- U-shaped, "
-                f"minimum inside the sweep.")
             log("This is the check lego_assemblies lacked; it is what catches a")
             log("time-misaligned action before the data is used.")
+            log(f"RESULT  servo lag = {best_lag} ms   (residual {best:.2f} mm, "
+                f"U-shaped with the minimum inside the sweep)")
 
     def _fk_check(self, log: Any) -> None:
         """Is the kinematic chain behind the 3D view actually right?
@@ -538,12 +538,12 @@ class Handler(BaseHTTPRequestHandler):
             pass
         n = float(np.linalg.norm(d))
         if n < 200:
-            log(f"OK: FK and the controller agree to {n:.0f} mm -- plausible for a "
-                f"flange-vs-tool difference. The chain looks right.")
+            log("  plausible for a flange-vs-tool difference, so the chain looks right.")
+            log(f"RESULT  FK agrees with the controller to {n:.0f} mm")
         else:
-            log(f"WARNING: {n:.0f} mm apart. That is too large to be a TCP offset; the "
-                f"chain in kinematics.py / armfk.js is probably wrong, so the 3D "
-                f"arm's pose is not trustworthy.")
+            log("That is too large to be a TCP offset; the chain in kinematics.py /")
+            log("armfk.js is probably wrong, so the 3D arm's pose is not trustworthy.")
+            log(f"RESULT  FAILED -- FK and the controller are {n:.0f} mm apart")
 
     def _reach_check(self, log: Any) -> None:
         """Are all eight corners of the safety box actually reachable?
@@ -576,10 +576,11 @@ class Handler(BaseHTTPRequestHandler):
             log(f"  world ({cx:6.0f},{cy:6.0f},{cz:6.0f}) -> "
                 f"{'reachable' if ok else f'UNREACHABLE (code {code})'}")
         if bad:
-            log(f"{bad}/8 corners unreachable. Shrink the box in the 3D scene panel, or "
-                f"the target can run away where the arm cannot follow.")
+            log("Shrink the box in the 3D scene panel, or the target can run away")
+            log("somewhere the arm cannot follow.")
+            log(f"RESULT  FAILED -- {bad}/8 workspace corners unreachable")
         else:
-            log("all 8 corners reachable")
+            log("RESULT  all 8 workspace corners reachable")
 
     def _camera_latency(self, log: Any) -> None:
         """Measure ACTION -> PIXEL latency by commanding the gripper and watching for it.
@@ -635,13 +636,20 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             arm.gripper_suspend(False)           # hand it back to the operator
         if hit is None:
-            log("no visible change within 3 s -- is the gripper in view?")
+            log("FAILED: no visible change within 3 s -- is the gripper in view of "
+                f"{label}? Check the pane, then try again.")
             return
-        log(f"first visible change {hit*1000:.0f} ms after the command")
-        log("(this is exposure + USB + decode + gripper travel, so it is an UPPER bound")
-        log(" on pure camera latency, and the right number for action->pixel staleness)")
+        # Explanation first, headline LAST. The panel auto-scrolls to the bottom, so
+        # whatever is printed last is what the operator actually sees -- and this used
+        # to end on "saved ... .measurements.json" followed by "[exit 0]", which reads
+        # as bookkeeping rather than a result. The number was three lines up in plain
+        # grey while the filing line got the green.
+        log("  measured: exposure + USB + decode + gripper travel, so it is an UPPER")
+        log("  bound on camera latency -- and the right number for action->pixel")
+        log("  staleness, which is what a world model conditions on.")
         save_measurement("camera_latency_s", {"seconds": hit, "camera": label})
-        log("saved camera_latency_s into campaigns/.measurements.json")
+        log(f"  recorded in campaigns/.measurements.json")
+        log(f"RESULT  camera latency = {hit*1000:.0f} ms   ({label})")
 
     def _save_cameras(self, body: dict) -> None:
         from .config import set_value
@@ -1117,6 +1125,9 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
 .tag{font-size:10px;font-weight:700;letter-spacing:.04em;padding:1px 6px;text-transform:uppercase;color:#fff}
 .tag.recording{background:var(--red);animation:pulse 1.1s ease-in-out infinite}
 .tag.processing{background:var(--amber)}
+/* stopped: no longer recording, not yet processed -- neutral, and NOT pulsing,
+   so it is obvious at a glance that the run is no longer live */
+.tag.stopped{background:var(--ink-3,#767d86)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
 @keyframes wig{0%,100%{transform:translateX(0)}15%{transform:translateX(-7px)}30%{transform:translateX(6px)}
  45%{transform:translateX(-5px)}60%{transform:translateX(4px)}75%{transform:translateX(-2px)}}
@@ -1132,6 +1143,9 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
 #term{flex:1;min-height:0;background:#000;border:1px solid #000;overflow:auto;padding:6px 8px;
   font:11px/1.35 ui-monospace,Menlo,Consolas,monospace;color:#d6dde3;white-space:pre-wrap;word-break:break-word}
 #term .e{color:#ff6b6b} #term .g{color:#4ade80} #term .c{color:#60a5fa} #term .w{color:#fbbf24}
+/* the answer a sanity task exists to produce -- must not be missable */
+#term .r{color:#0b1220;background:#4ade80;font-weight:700;padding:1px 5px;
+  display:inline-block;margin:3px 0}
 .spin{display:inline-block;width:8px;height:8px;background:var(--blue);animation:pulse .9s ease-in-out infinite}
 /* ticker: flush to the panel edges, scrolls forever like a stock ticker */
 #ticker{flex:none;overflow:hidden;white-space:nowrap;border-bottom:1px solid var(--line);
@@ -1263,7 +1277,6 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
       <button class=sbtn onclick="sanity('fkcheck')" data-excl data-tip="Compare FK(joints) with the controller's own TCP pose -- verifies the chain behind the 3D view." title="Compare FK(joints) with the controller's own TCP pose -- verifies the chain behind the 3D view.">FK check</button>
       <button class=sbtn onclick="sanity('reach')" data-excl data-tip="Are all 8 corners of the safety box reachable?" title="Are all 8 corners of the safety box reachable?">workspace reach</button>
       <button class=sbtn onclick="sanity('validate')" title="Check every run for the known failure modes.">validate runs</button>
-      <button class=sbtn onclick="sanity('preview')" id=pvbtn title="Feed the dashboard synthetic data (no hardware).">preview mode</button>
     </div>
     <div id=term></div>
   </div>
@@ -1272,13 +1285,12 @@ h1{margin:0;font-size:16px} .sub{color:var(--dim);font-size:12px}
   <div id=ticker class=blue><span class=t id=tickertext></span></div>
   <div class=mode>
     <span id=modetxt class=sub></span>
-    <button id=backlive style="margin-left:auto;display:none" onclick=goLive()>Back to live</button>
   </div>
   <div id=imgblock>
     <div id=cams></div>
     <div id=pbbar class=off>
       <button id=pbtn onclick=togglePlay()>Play</button>
-      <button id=pstop onclick=stopPlay()>Stop</button>
+      <button id=pstop onclick=stopPlay()>Back to live</button>
       <div id=pbslider></div>
       <span id=ptime class=sub style="font-variant-numeric:tabular-nums">0.0 / 0.0 s</span>
     </div>
@@ -1380,8 +1392,9 @@ async function loadCampaign(){
   c.runs.slice().reverse().forEach(r=>{
     const d=document.createElement('div');
     d.className='run'+(SEL===r.name?' sel':''); d.id='run_'+r.name;
+    const TAGTEXT={recording:'recording',stopped:'stopped',processing:'processing'};
     const tag=r.status==='ready'?'':
-      `<span class="tag ${r.status}">${r.status==='recording'?'in progress':'processing'}</span>`;
+      `<span class="tag ${r.status}">${TAGTEXT[r.status]||r.status}</span>`;
     d.innerHTML=`<span class="dot${r.complete?'':' bad'}"></span>
       <div class=meta><div><span class=n>${String(r.index).padStart(4,'0')}</span> ${tag}</div>
       <div class=ts>${r.timestamp||''}</div></div>
@@ -1467,6 +1480,7 @@ function camOrder(labels){
     return (ia<0?99:ia)-(ib<0?99:ib);
   });
 }
+let WASREC=false;   // last seen recording state, to spot transitions
 let POLL=[];        // one self-pacing snapshot loop per live camera
 function stopPolling(){ POLL.forEach(p=>{p.stop=true}); POLL=[]; }
 function camGrid(labels,playback){
@@ -1496,6 +1510,12 @@ es.onmessage=e=>{ LIVE=JSON.parse(e.data);
   if(!REP){ draw(LIVE.controller||{}); proprio(LIVE.proprio||{});
     const st=LIVE.status||{};
     if(st.cameras && st.cameras.join()!==CAMS.join()) camGrid(st.cameras,false);
+    // Refresh the run list the moment recording starts or stops, instead of waiting
+    // for the 4 s poll -- that delay made the tag look stuck on "recording" after B.
+    const nowRec=!!st.recording;
+    if(nowRec!==WASREC){ WASREC=nowRec; loadCampaign();
+      // and again shortly after, to catch stopped -> processing -> ready
+      setTimeout(loadCampaign,600); setTimeout(loadCampaign,2000); }
     modetxt.textContent=st.recording?`${st.run_name||''} - ${fmt(st.elapsed)}s`:(st.hint||'');
     PREVIEW=!!st.preview;
     // Mirror the server-side lockout: these take over the arm and cameras, so they
@@ -1562,7 +1582,7 @@ async function openRun(name){
   modetxt.textContent=`${name} - ${fmt(r.duration_s)}s`
     + (r.trimmed_s>0.05?` (trimmed ${fmt(r.trimmed_s)}s where a stream was missing)`:'');
   setTicker('PLAY BACK '+name,'blue');
-  backlive.style.display=''; pbbar.classList.remove('off');
+  pbbar.classList.remove('off');
   DUR=Math.max(0.1,r.duration_s); SLIDER.updateOptions({range:{min:0,max:DUR}},true);
   T0=performance.now()/1000; PLAYING=true; pbtn.textContent='Pause';
   // Actually start them. openRun set PLAYING=true but never called play(), so the
@@ -1571,7 +1591,7 @@ async function openRun(name){
     if(v){ v.currentTime=(c.skip||0); const p=v.play(); if(p&&p.catch) p.catch(()=>{}); } });
   requestAnimationFrame(tick);
 }
-function goLive(){ REP=null; PLAYING=false; backlive.style.display='none';
+function goLive(){ REP=null; PLAYING=false;
   pbbar.classList.add('off');
   SEL=null; loadCampaign(); const st=LIVE.status||{}; camGrid(st.cameras||[],false);
   modetxt.textContent=''; }
@@ -1614,8 +1634,11 @@ function tick(){ if(!REP||!PLAYING)return; let t=performance.now()/1000-T0;
   apply(t); requestAnimationFrame(tick); }
 
 let SINCE=0;
-function cls(l){ if(/FAIL|error|Error|Traceback|WARNING|refused|not found/.test(l))return 'e';
-  if(/PASS|OK:|saved|verified|reached|connected/.test(l))return 'g';
+function cls(l){ if(/FAILED|FAIL|error|Error|Traceback|WARNING|refused|not found/.test(l))return 'e';
+  // RESULT lines are the point of a sanity task, so they get the emphasis. "saved"
+  // used to win it, which highlighted the bookkeeping and left the number plain.
+  if(/^RESULT/.test(l))return 'r';
+  if(/PASS|OK:|verified|reached|connected/.test(l))return 'g';
   if(/^\$ /.test(l))return 'c'; if(/WARN|processing/.test(l))return 'w'; return ''; }
 async function pollSanity(){
   try{ const r=await (await fetch('/api/sanity/log?since='+SINCE)).json();

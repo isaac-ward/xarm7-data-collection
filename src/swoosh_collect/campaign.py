@@ -92,14 +92,18 @@ class Run:
 
     @property
     def status(self) -> str:
-        """recording -> processing -> ready.
+        """recording -> stopped -> processing -> ready.
+
+        `stopped` exists so the tag changes the instant B is pressed. Without it the
+        run stayed labelled "recording" until the summariser subprocess had spawned
+        and the 4 s poll came round, which read as the run still being live.
 
         Written by the collector, so the UI can show a run the instant A is pressed
         rather than only once its files exist. A run from an older/crashed session
         has no status field; infer one from what is on disk so it still lists.
         """
         st = self.meta.get("status")
-        if st in {"recording", "processing", "ready"}:
+        if st in {"recording", "stopped", "processing", "ready"}:
             return str(st)
         if not self.meta:
             return "recording"
@@ -175,6 +179,26 @@ class Campaign:
             return []
         return [cls(p) for p in sorted(root.iterdir()) if (p / "campaign.json").is_file()]
 
+    @classmethod
+    def latest(cls, cfg: dict | None = None) -> "Campaign | None":
+        """The most recently CREATED campaign, or None if there are none.
+
+        Ordered by campaign.json's created_unix rather than mtime: a campaign gets
+        written to every time a run lands in it, so mtime would return whichever was
+        last recorded into, not the newest one.
+        """
+        best, best_t = None, None
+        for c in cls.list_all(cfg):
+            t = c.meta.get("created_unix")
+            if t is None:
+                try:
+                    t = c.meta_path.stat().st_mtime
+                except OSError:
+                    t = 0
+            if best_t is None or float(t) > best_t:
+                best, best_t = c, float(t)
+        return best
+
     # -- contents ------------------------------------------------------------
     @property
     def meta(self) -> dict[str, Any]:
@@ -241,6 +265,52 @@ def set_run_status(run_dir: Path, status: str, **extra: Any) -> None:
 
 
 # -- CLI ---------------------------------------------------------------------
+def _print_readiness(cfg: dict) -> None:
+    """What still needs doing before collecting into a NEW campaign.
+
+    Most bring-up state is deliberately NOT per-campaign -- the frame verification is
+    keyed to the frame matrix's hash and the camera latency to the rig, both stored at
+    the campaigns/ root. So a new campaign does not invalidate them, and saying so
+    stops a two-hour session opening with a 20-minute re-check nobody needed. What DOES
+    need attention is anything that changed since those were taken.
+    """
+    import time as _t
+
+    from .provenance import frame_is_verified, load_measurements
+
+    print("\nBEFORE YOU COLLECT")
+    ok, why = frame_is_verified()
+    if ok:
+        print(f"  [done] 45-degree frame -- {why}")
+        print("         Verification is keyed to the MATRIX HASH, not the campaign, so")
+        print("         it carries over. It only needs redoing if the matrix changes")
+        print("         (and then it invalidates itself and refuses to collect).")
+    else:
+        print(f"  [TODO] 45-degree frame -- {why}")
+        print("         Press 'verify 45 frame' in the dashboard. GATES COLLECTION.")
+
+    m = load_measurements()
+    cl = (m or {}).get("camera_latency_s", {})
+    if cl:
+        age_h = (_t.time() - float(cl.get("when_unix", 0))) / 3600.0
+        v = (cl.get("value") or {}).get("seconds")
+        print(f"  [done] camera latency -- {float(v)*1000:.0f} ms, measured "
+              f"{age_h:.1f} h ago")
+        print("         Redo it only if you moved a camera or changed the gripper.")
+    else:
+        print("  [TODO] camera latency -- press 'camera latency'. One press; it")
+        print("         records the action-to-pixel offset into provenance.")
+
+    print("  [each session] 'check arm' -- read-only, ~15 s. Confirms the controller")
+    print("         is healthy and nothing is latched before you commit two hours.")
+    print("  [if the box moved] 'workspace reach' + `swoosh-home --solve`, so the home")
+    print("         pose and the safety box cannot disagree.")
+    print("  [if a camera was unplugged] 'name cameras', then eyeball the four panes.")
+    print("         Labels pin to USB ports, and every unit shares one serial, so a")
+    print("         cable swapped between ports relabels silently.")
+    print()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Create and inspect collection campaigns.",
@@ -262,8 +332,10 @@ def main() -> int:
     if args.cmd == "new":
         c = Campaign.create(args.name, cfg, notes=args.notes)
         print(f"created campaign {c.name!r}")
-        print(f"  {c.path}")
-        print(f"\nCollect into it with:\n  swoosh-collect --campaign {c.path.name}")
+        print(f"  {host_view(c.path)}")
+        print(f"\nCollect into it with:\n  swoosh-collect"
+              f"   (this is now the most recent campaign, so it is the default)")
+        _print_readiness(cfg)
         return 0
 
     if args.cmd == "list":

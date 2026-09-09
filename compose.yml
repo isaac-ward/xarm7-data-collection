@@ -54,7 +54,7 @@ services:
       bash -c "
       ip -4 -brief addr show ${SWOOSH_NIC:-enp129s0} | grep -q '192.168.1.100/'
       || ip addr add 192.168.1.100/24 dev ${SWOOSH_NIC:-enp129s0};
-      swoosh-collect --campaign \"$${CAMPAIGN:?set CAMPAIGN=<name>}\" $${COLLECT_ARGS:-}"
+      swoosh-collect $${CAMPAIGN:+--campaign \"$$CAMPAIGN\"} $${COLLECT_ARGS:-}"
 
   sanity:
     <<: *base

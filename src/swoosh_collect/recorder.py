@@ -106,7 +106,10 @@ class RunRecorder:
         }
         if gripper_sent:
             row["gripper_sent_position"] = gripper_sent.get("sent_position")
-            row["gripper_sent_t"] = gripper_sent.get("sent_t")
+            # already on the run's clock (the arm is told t_loop0)
+            st = gripper_sent.get("sent_t")
+            row["gripper_sent_t"] = st
+            row["gripper_sent_age_s"] = None if st is None else t - float(st)
             row["gripper_sent_code"] = gripper_sent.get("sent_code")
             if gripper_sent.get("sent_error"):
                 row["gripper_sent_error"] = gripper_sent["sent_error"]

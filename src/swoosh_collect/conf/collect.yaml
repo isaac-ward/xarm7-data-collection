@@ -148,7 +148,13 @@ controller:
     move_x: true
     move_y: true
     height: true
-    yaw: false
+    # Yaw about world +Z is COUNTER-clockwise seen from above (right-hand rule), so an
+    # un-inverted right-stick-right produced a counter-clockwise turn. Inverted, right
+    # = clockwise and left = counter-clockwise, which is what an operator expects.
+    # NOTE: this changes the SIGN of action.yaw and target_yaw_world_deg. Runs recorded
+    # before 2026-09-09 have the opposite convention; the value is in every run's
+    # config provenance, so check it before pooling old and new episodes.
+    yaw: true
 
 cameras:
   # Discovered from /sys/class/video4linux/*/name, one entry per physical USB device.

@@ -36,7 +36,7 @@ class PadSnapshot:
     # every `t` in this project is relative to t_loop0, and mixing the two produced
     # nonsense. An age is meaningful without knowing either epoch.
     raw_age_s: dict[str, float] = field(default_factory=dict)
-    # oldest age across the axes that actually drive the arm, in seconds
+    # age of the FRESHEST driving axis, in seconds -- see _freshest_age
     input_age_s: float = float("nan")
 
     def as_row(self) -> dict[str, Any]:
@@ -72,18 +72,22 @@ def _ages(now_abs: float, raw_t: dict) -> dict:
             for k, v in raw_t.items() if not math.isnan(v)}
 
 
-def _oldest_age(now_abs: float, raw_t: dict, codes: list) -> float:
-    """Oldest age in seconds among the named axes' kernel event times.
+def _freshest_age(now_abs: float, raw_t: dict, codes: list) -> float:
+    """Age in seconds of the FRESHEST driving axis.
 
-    `now_abs` MUST be absolute time.monotonic(), not the loop-relative `t` the rest of
-    the recorder uses -- the kernel's stamps are absolute, and subtracting one from the
-    other gave ages of -12300553 ms, i.e. the epoch gap rather than any latency.
+    Not the oldest: an axis nobody is touching reports nothing, so its last value is
+    legitimately minutes old and swamped the statistic (an untouched trigger made this
+    read 139 s). The freshest axis is the one that just moved, which is the latency
+    that matters. Per-axis ages are in `raw_age_s` for anything finer.
+
+    `now_abs` MUST be absolute time.monotonic() -- the kernel's stamps are absolute,
+    while every `t` in a run is relative to t_loop0.
     """
     import math
 
     ages = [now_abs - raw_t[c] for c in codes
             if c and c in raw_t and not math.isnan(raw_t[c])]
-    return max(ages) if ages else float("nan")
+    return min(ages) if ages else float("nan")
 
 
 class XboxPad:
@@ -268,7 +272,7 @@ class XboxPad:
             raw_age_s=_ages(time.monotonic(), raw_t),
             # How stale the driving axes are, measured rather than assumed. The five
             # axes that move the arm; NaN if the kernel would not give us its clock.
-            input_age_s=_oldest_age(time.monotonic(), raw_t, [
+            input_age_s=_freshest_age(time.monotonic(), raw_t, [
                 self.axis_map.get(k) for k in
                 ("move_x", "move_y", "height", "yaw", "gripper")]),
         )

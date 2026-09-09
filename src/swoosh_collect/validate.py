@@ -87,6 +87,7 @@ def validate_run(run_dir: Path, cfg: dict) -> dict[str, Any]:
     cmd = _read_jsonl(run_dir / "raw" / "commanded.jsonl")
     stt = _read_jsonl(run_dir / "raw" / "arm_state.jsonl")
     tk = _read_jsonl(run_dir / "raw" / "tick.jsonl")
+    xac = _read_jsonl(run_dir / "raw" / "xarm_command.jsonl")
 
     if not (ctl and cmd and stt):
         return {"ok": False, "checks": [_r("streams", "fail", "missing raw streams")]}
@@ -198,16 +199,24 @@ def validate_run(run_dir: Path, cfg: dict) -> dict[str, Any]:
     # 2d. how stale the recorded action actually is, measured not assumed.
     # Only over ticks where the stick is MOVING: a resting stick reports nothing, so
     # its last value is legitimately old and would swamp the statistic.
-    aged = [r for r in ctl if r.get("input_age_s") is not None]
+    # Per-AXIS, and only for axes whose value actually changed on that tick. A single
+    # scalar per tick cannot express this: an untouched trigger is genuinely minutes
+    # stale while the stick being moved is milliseconds fresh, so any max/min over all
+    # axes describes the wrong thing. raw_age_s carries each axis separately.
     import math as _m
+    AXES = ("move_x", "move_y", "height", "yaw", "gripper")
+    axis_code = {k: get(cfg, f"controller.axes.{k}") for k in AXES}
     moving = []
     prev = None
-    for r in aged:
-        cur = (r.get("move_x", 0), r.get("move_y", 0), r.get("height", 0),
-               r.get("yaw", 0), r.get("gripper", 0))
-        a = r.get("input_age_s")
-        if prev is not None and cur != prev and a is not None and not _m.isnan(a):
-            moving.append(float(a))
+    for r in ctl:
+        cur = {k: r.get(k, 0) for k in AXES}
+        ages = r.get("raw_age_s") or {}
+        if prev is not None:
+            for k in AXES:
+                if cur[k] != prev[k]:
+                    a = ages.get(axis_code.get(k))
+                    if a is not None and not _m.isnan(float(a)):
+                        moving.append(float(a))
         prev = cur
     if moving and min(moving) < -0.001:
         # Negative ages are impossible. Runs recorded before 2026-09-08 stamped these
@@ -224,7 +233,7 @@ def validate_run(run_dir: Path, cfg: dict) -> dict[str, Any]:
         p50, p95 = float(_np.median(arr)), float(_np.percentile(arr, 95))
         out.append(_r("action staleness (moving)", "warn" if p95 > 0.030 else "pass",
                       f"median {p50*1000:.1f} ms, p95 {p95*1000:.1f} ms behind the "
-                      f"operator's thumb, over {len(moving)} changing ticks",
+                      f"operator's thumb, over {len(moving)} axis-changes",
                       median_ms=p50 * 1000, p95_ms=p95 * 1000))
     else:
         out.append(_r("action staleness (moving)", "warn",
@@ -239,6 +248,46 @@ def validate_run(run_dir: Path, cfg: dict) -> dict[str, Any]:
                       f"{len(alive) - bad}/{len(alive)} state rows had a live report "
                       f"stream" + ("" if bad == 0 else
                                    " -- joint reads during the dead window are suspect")))
+
+    # 2f. EVERY timestamp field must lie inside the run's own window.
+    # Two fields shipped stamped with absolute time.monotonic() while every `t` is
+    # relative to t_loop0 -- 61,615 s adrift, which made the export resample against a
+    # clock it shared nothing with. A field claiming to be a time is checked against
+    # the window it must live in, so the next one cannot pass silently.
+    win_lo = min(r["t"] for r in (ctl[:1] + cmd[:1] + stt[:1]))
+    win_hi = max(r["t"] for r in (ctl[-1:] + cmd[-1:] + stt[-1:]))
+    slack = 5.0
+    bad_fields: dict[str, tuple] = {}
+    for nm, rows in (("controller", ctl), ("commanded", cmd),
+                     ("xarm_command", xac), ("arm_state", stt)):
+        for r in rows:
+            for k, v in r.items():
+                if k == "t" or not k.endswith("_t"):
+                    continue
+                if v is None or not isinstance(v, (int, float)):
+                    continue
+                if isinstance(v, float) and v != v:      # NaN is "not measured"
+                    continue
+                # A "when did X last happen" stamp can legitimately predate the
+                # run -- the last gripper command often lands during startup, before
+                # A was pressed, giving a small negative value. That is the right
+                # clock, not the wrong epoch. Only the magnitude distinguishes them:
+                # t_loop0-relative times are seconds, a foreign epoch is tens of
+                # thousands. So allow anything from the session start onwards.
+                if not (-slack <= v <= win_hi + slack):
+                    key = f"{nm}.{k}"
+                    if key not in bad_fields:
+                        bad_fields[key] = (v, win_lo, win_hi)
+    if bad_fields:
+        detail = "; ".join(
+            f"{k}={v:.1f} outside [0,{hi:.1f}]"
+            for k, (v, lo, hi) in sorted(bad_fields.items()))
+        out.append(_r("timestamp fields share one clock", "fail",
+                      f"{detail} -- a different epoch, so anything resampled on it is "
+                      f"aligned to nothing"))
+    else:
+        out.append(_r("timestamp fields share one clock", "pass",
+                      "every *_t field lies inside the run's window"))
 
     # 3. rates
     for nm, rows, want in (("controller", ctl, get(cfg, "control.rate_hz", 100.0)),

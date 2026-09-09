@@ -105,11 +105,21 @@ def main() -> int:
                  "this run cleared errors; if it persists, check the e-stop")
         else:
             _ok("no latched controller error")
-        if st.gripper_pos == st.gripper_pos:  # not NaN
-            _ok(f"gripper position {st.gripper_pos:.0f}")
+        # Ask the device directly. st.gripper_pos is the value cached by the gripper
+        # WORKER thread, and this one-shot check never starts that worker -- so it was
+        # always NaN and this always warned "gripper did not report a position", on a
+        # rig where the live collector reads 850 perfectly well. A check that cries
+        # wolf on every bring-up is worse than no check.
+        try:
+            gcode, gpos = arm.api.get_gripper_position()
+        except Exception as exc:
+            gcode, gpos = -1, None
+            print(f"  {YELLOW}WARN{RESET} gripper read raised: {exc}")
+        if gcode == 0 and gpos is not None:
+            _ok(f"gripper position {float(gpos):.0f}")
         else:
             print(f"  {YELLOW}WARN{RESET} gripper did not report a position "
-                  f"(expected if none is attached)")
+                  f"(code {gcode}) -- expected only if none is attached")
 
         if args.home:
             arm.go_home()
@@ -152,7 +162,10 @@ def main() -> int:
     finally:
         arm.shutdown()
 
-    print(f"\n{'all checks passed' if not fails else f'{fails} check(s) FAILED'}\n")
+    # RESULT-prefixed so the dashboard's terminal highlights it and it is the last
+    # thing on screen -- the panel auto-scrolls, so a summary buried above the
+    # bookkeeping reads as no summary at all.
+    print(f"\nRESULT  {'all checks passed' if not fails else f'{fails} check(s) FAILED'}\n")
     return 1 if fails else 0
 
 
