@@ -229,6 +229,16 @@ recording:
   # after the control loop. Loss BEYOND this (or beyond min_coverage of the run,
   # whichever is larger) is what gets a run refused.
   coverage_allowance_s: 2.5
+  # Warn when the measured camera-vs-arm-state offset exceeds this, in MILLISECONDS.
+  # Not zero, because this rig has a real and constant offset: every trustworthy
+  # measurement (sharp correlation peak, inside the sweep) has come back +75.4, +80.3,
+  # +111.7 ms -- mean +89.1, sd 16.1, always the same sign. That is the camera's own
+  # capture latency, which the V4L2 kernel timestamp cannot remove because the buffer
+  # is stamped once FILLED, after exposure, readout, MJPG compression and USB transfer.
+  # So this threshold asks "has the offset CHANGED", which is the useful question.
+  # DO NOT shift the image stream to compensate: it is 2.7 frames at 30 Hz, so you
+  # would be rounding an estimate into the data. It is recorded per run instead.
+  camera_align_warn_ms: 120.0
 dashboard:
   refresh_hz: 15.0
   port: 8770

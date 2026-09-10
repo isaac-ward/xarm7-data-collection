@@ -384,9 +384,25 @@ def validate_run(run_dir: Path, cfg: dict) -> dict[str, Any]:
                               lag_s=cl["lag_s"], peak_corr=cl["peak_corr"],
                               indeterminate=True))
             else:
-                # A sharp peak inside the sweep IS a measurement; judge it.
+                # A sharp peak inside the sweep IS a measurement; judge it against the
+                # offset this rig is KNOWN to have, not against zero.
+                #
+                # Measured on every trustworthy estimate to date (sharp peak, inside
+                # the sweep): +75.4, +80.3 and +111.7 ms -- mean +89.1, sd 16.1, all
+                # the same sign. That is the camera's own capture latency: the kernel
+                # stamps a buffer once it is FILLED, which is after exposure, sensor
+                # readout, on-camera MJPG compression and USB transfer, so the photons
+                # landed before the timestamp and no timestamp fix can remove it.
+                # read_lag_s (21 ms) covers only post_read - kernel, a later stage.
+                #
+                # Judging against zero made every healthy run warn, and a permanent
+                # warning is one nobody reads. So the threshold sits above the known
+                # offset with headroom: what matters now is a DEPARTURE from it.
+                thresh = float(get(cfg, "recording.camera_align_warn_ms", 120.0))
                 out.append(_r("camera vs arm-state alignment",
-                              "pass" if abs(lag_ms) < 40.0 else "warn", detail,
+                              "pass" if abs(lag_ms) < thresh else "warn",
+                              detail + f" (warns beyond {thresh:.0f} ms; this rig's "
+                                       f"known offset is ~89 ms)",
                               lag_s=cl["lag_s"], peak_corr=cl["peak_corr"]))
         else:
             out.append(_r("camera vs arm-state alignment", "warn",
