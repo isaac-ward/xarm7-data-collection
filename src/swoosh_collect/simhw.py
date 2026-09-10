@@ -77,6 +77,10 @@ class SimulatedArm:
         self._target = self._pose.copy()
         self._grip_cmd = 0.0
         self._grip_pos = float(get(cfg, "gripper.open_position", 850))
+        self._grip_sent: float | None = None
+        self._grip_sent_t: float | None = None
+        self._grip_suspended = False
+        self._clock_origin = 0.0
         self._lock = threading.Lock()
 
     # -- lifecycle -----------------------------------------------------------
@@ -107,7 +111,9 @@ class SimulatedArm:
         cl = float(get(self.cfg, "gripper.closed_position", 0))
         with self._lock:
             self._grip_cmd = max(0.0, min(1.0, float(closure)))
-        return op + (cl - op) * self._grip_cmd
+            self._grip_sent = op + (cl - op) * self._grip_cmd
+            self._grip_sent_t = time.monotonic() - self._clock_origin
+        return self._grip_sent
 
     def _advance(self) -> None:
         """First-order lag toward the target. Called on every read."""
@@ -136,6 +142,33 @@ class SimulatedArm:
         st.state, st.mode, st.error_code, st.warn_code = 0, 1, 0, 0
         return st
 
+    # --- the rest of the RightArm surface, so --simulate cannot drift out of sync
+    # with the real driver. tests/test_sim_interface.py asserts this stays complete.
+    def set_clock_origin(self, t0: float) -> None:
+        self._clock_origin = float(t0)
+
+    def gripper_command_record(self) -> dict:
+        with self._lock:
+            return {"sent_position": (None if self._grip_sent is None
+                                      else float(self._grip_sent)),
+                    "sent_code": 0, "sent_error": "", "sent_t": self._grip_sent_t}
+
+    def gripper_suspend(self, on: bool) -> None:
+        self._grip_suspended = bool(on)
+
+    def clear_errors(self) -> bool:
+        return True
+
+    def estop_engaged(self) -> bool:
+        return False
+
+    def joints_now(self):
+        return self.read_state(0.0).joints_deg
+
+    def world_target_to_base(self, world_xyz, rpy_deg):
+        from .frames import world_to_base
+        return [*world_to_base(world_xyz).tolist(), *rpy_deg]
+
     def current_pose_world(self):
         with self._lock:
             pose = self._pose.copy()
@@ -151,6 +184,9 @@ class SimulatedPad:
         self.idle = idle          # True -> all zeros, for a "connected but still" rig
         self._t0 = time.monotonic()
         self._device = type("Dev", (), {"name": "simulated pad"})()
+
+    def find_device(self):
+        return self._device
 
     def start(self) -> bool:
         return True
@@ -299,6 +335,11 @@ class SimulatedCameraRig:
                 "frames_in_mp4": _count_frames(self.out_dir / f"{c.label}.mp4"),
                 "t": [round(t, 6) for t in c.timestamps],
             }))
+
+    def expected_missing(self) -> list[str]:
+        """Labels configured but not streaming. Nothing is ever missing in simulation
+        -- the rig manufactures exactly the expected set."""
+        return []
 
     def status(self) -> list[dict[str, Any]]:
         return [{"label": c.label, "frames": c.frames_written,
