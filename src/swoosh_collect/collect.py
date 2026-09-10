@@ -72,20 +72,23 @@ def _health_check(run_dir: Path, cfg: dict, log) -> tuple[bool, list[str]]:
 
     fails = [c["check"] for c in res.get("checks", []) if c.get("level") == "fail"]
     warns = [c["check"] for c in res.get("checks", []) if c.get("level") == "warn"]
+    n_pass, n_total = res.get("n_pass", 0), res.get("n_total", 0)
+    all_green = bool(res.get("all_green"))
+    # `ok` (no failures) is what gates the export; `all_green` (nothing short of a
+    # full pass) is what the operator sees. They are deliberately different: a
+    # warning is exportable but should still not look clean.
     ok = bool(res.get("ok"))
-    # store alongside the run so the exporter's refusal and the card agree
     set_run_status(run_dir, "ready", validation=res, checks_ok=ok,
-                   checks_reasons=fails)
-    if ok:
-        log(f"[health] {run_dir.name}: CHECKS PASSED"
-            + (f" ({len(warns)} warning(s): {', '.join(warns)})" if warns else ""))
-    else:
-        log(f"[health] {run_dir.name}: CHECKS FAILED -- {len(fails)} failure(s)",
-            err=True)
-        for c in res.get("checks", []):
-            if c.get("level") == "fail":
-                log(f"  FAIL  {c['check']}: {c.get('detail', '')}", err=True)
-    return ok, fails
+                   checks_reasons=fails + warns,
+                   checks_pass=n_pass, checks_total=n_total, checks_green=all_green)
+    verdict = "CHECKS PASSED" if all_green else "CHECKS FAILED"
+    log(f"[health] {run_dir.name}: {verdict} {n_pass}/{n_total}", err=not all_green)
+    for c in res.get("checks", []):
+        if c.get("level") == "fail":
+            log(f"  FAIL  {c['check']}: {c.get('detail', '')}", err=True)
+        elif c.get("level") == "warn":
+            log(f"  WARN  {c['check']}: {c.get('detail', '')}", err=True)
+    return ok, fails + warns
 
 
 def _process_run_async(run_dir: Path, cfg: dict, inflight: set,

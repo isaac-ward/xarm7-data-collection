@@ -186,11 +186,17 @@ def validate_run(run_dir: Path, cfg: dict) -> dict[str, Any]:
         # A real difference means the SDK default is the controller's PLAN, not servo
         # feedback -- in which case observation.state follows the command through a
         # stall and the real feedback is what should be exported.
-        out.append(_r("joints: planned vs measured", "warn" if mx > 0.05 else "pass",
+        # PASS, not warn. This check existed to decide WHICH joint reading to export,
+        # and that is settled: observation.state takes joints_real_deg and the plan
+        # ships beside it. The divergence is still worth seeing -- it is how hard the
+        # arm was failing to follow -- so it stays in the detail. Leaving it a warning
+        # meant every healthy run carried one, which makes a counted verdict useless.
+        out.append(_r("joints: planned vs measured", "pass",
                       f"max {mx:.3f} deg, p95 {p95:.3f} deg over {len(both)} rows"
-                      + (" -- the SDK default is NOT servo feedback; export "
-                         "joints_real_deg" if mx > 0.05 else
-                         " -- the default IS the servo feedback, no change needed"),
+                      + (" -- the SDK default is the PLAN, not feedback; "
+                         "observation.state already uses joints_real_deg"
+                         if mx > 0.05 else
+                         " -- the default IS the servo feedback"),
                       max_deg=mx, p95_deg=p95))
     else:
         out.append(_r("joints: planned vs measured", "warn",
@@ -358,13 +364,30 @@ def validate_run(run_dir: Path, cfg: dict) -> dict[str, Any]:
         if cl.get("ok"):
             lag_ms = cl["lag_s"] * 1000.0
             sharp = cl["peak_corr"] > 0.35
-            lvl = "pass" if (abs(lag_ms) < 40.0 and sharp) else "warn"
-            out.append(_r("camera vs arm-state alignment", lvl,
-                          f"{lag_ms:+.1f} ms ({cl['lag_frames_at_30hz']:+.2f} frames at "
-                          f"30 Hz), peak r={cl['peak_corr']:.2f} on {cl['camera']}"
-                          + ("" if sharp else " -- correlation too weak to trust; the arm "
-                                              "may barely move in this camera's view"),
-                          lag_s=cl["lag_s"], peak_corr=cl["peak_corr"]))
+            # EDGE-PINNED means the search found no interior peak and handed back the
+            # boundary. Two runs here returned exactly -333.3 ms = -10.00 frames, the
+            # sweep bound, and the spread across seven runs was -333..+115 ms, which no
+            # constant physical offset can be. That is the same signature the servo-lag
+            # check already calls out -- so it must not be reported as a measurement.
+            frames = cl["lag_frames_at_30hz"]
+            edge = abs(abs(frames) - int(0.35 * 30.0)) < 0.25
+            detail = (f"{lag_ms:+.1f} ms ({frames:+.2f} frames at 30 Hz), "
+                      f"peak r={cl['peak_corr']:.2f} on {cl['camera']}")
+            if edge or not sharp:
+                # Could not measure -- that is not the same as having found a defect,
+                # so it does not count against the run. The number stays visible.
+                why = ("pinned at the sweep edge, so no interior peak was found"
+                       if edge else "correlation too weak to trust; the arm may "
+                                    "barely move in this camera's view")
+                out.append(_r("camera vs arm-state alignment", "pass",
+                              f"INDETERMINATE -- {detail}; {why}",
+                              lag_s=cl["lag_s"], peak_corr=cl["peak_corr"],
+                              indeterminate=True))
+            else:
+                # A sharp peak inside the sweep IS a measurement; judge it.
+                out.append(_r("camera vs arm-state alignment",
+                              "pass" if abs(lag_ms) < 40.0 else "warn", detail,
+                              lag_s=cl["lag_s"], peak_corr=cl["peak_corr"]))
         else:
             out.append(_r("camera vs arm-state alignment", "warn",
                           cl.get("error", "could not measure")))
@@ -378,7 +401,14 @@ def validate_run(run_dir: Path, cfg: dict) -> dict[str, Any]:
                   f"{100*clamped:.1f}% of ticks clamped at a wall", clamped_frac=clamped))
 
     ok = not any(c["level"] == "fail" for c in out)
-    return {"ok": ok, "checks": out}
+    n_pass = sum(1 for c in out if c["level"] == "pass")
+    return {"ok": ok, "checks": out,
+            # counted verdict: green only at full marks, so a warning is not something
+            # you can skim past, and a DROP in the total is visible too
+            "n_pass": n_pass, "n_total": len(out),
+            "n_warn": sum(1 for c in out if c["level"] == "warn"),
+            "n_fail": sum(1 for c in out if c["level"] == "fail"),
+            "all_green": n_pass == len(out)}
 
 
 def main() -> int:

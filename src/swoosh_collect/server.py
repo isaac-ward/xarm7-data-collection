@@ -767,6 +767,9 @@ class Handler(BaseHTTPRequestHandler):
                 # health verdict, written when processing finished
                 "checks_ok": r.meta.get("checks_ok"),
                 "checks_reasons": r.meta.get("checks_reasons") or [],
+                "checks_pass": r.meta.get("checks_pass"),
+                "checks_total": r.meta.get("checks_total"),
+                "checks_green": r.meta.get("checks_green"),
             })
         return {"name": c.name, "slug": c.path.name, "path": str(c.path),
                 "runs": runs, "complete": sum(r["complete"] for r in runs)}
@@ -1404,11 +1407,14 @@ async function loadCampaign(){
       `<span class="tag ${r.status}">${TAGTEXT[r.status]||r.status}</span>`;
     // Health verdict, once processing has produced one. A run that failed its checks
     // must be obvious on the card -- it is what the exporter will refuse.
-    if(r.status==='ready' && r.checks_ok!=null){
-      tag += r.checks_ok
-        ? `<span class="tag okchecks" title="all health checks passed">checks passed</span>`
+    if(r.status==='ready' && r.checks_total){
+      // Green ONLY at full marks. A warning is exportable but must not look clean,
+      // and a shrinking total is as informative as a failure.
+      const n=`${r.checks_pass}/${r.checks_total}`;
+      tag += r.checks_green
+        ? `<span class="tag okchecks" title="every health check passed">checks passed ${n}</span>`
         : `<span class="tag badchecks" title="${esc(r.checks_reasons.join('; '))}"
-             >checks failed</span>`;
+             >checks failed ${n}</span>`;
     }
     d.innerHTML=`<span class="dot${r.complete?'':' bad'}"></span>
       <div class=meta><div><span class=n>${String(r.index).padStart(4,'0')}</span> ${tag}</div>

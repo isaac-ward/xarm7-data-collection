@@ -179,14 +179,22 @@ def export_run(run_dir: Path, cfg: dict) -> dict[str, Any] | None:
     grid = lo + np.arange(n) / fps
 
     errs = []
-    # --- action: what the OPERATOR did (5 dims) -----------------------------
+    # --- action: what the OPERATOR did. STAYS the Xbox input, because that is the
+    # causal signal -- the thing a person actually did. Now 6 dims: both triggers are
+    # carried, the right one as `gripper` (it drives the jaws) and the left one raw.
+    # The left trigger is unbound, so it reads zero unless someone binds it -- but
+    # recording it means the column exists the day someone does, and an unbound axis
+    # reading zero is distinguishable from an axis nobody recorded at all.
     a_t = np.asarray([r["t"] for r in ctl])
+    _lt = str(get(cfg, "controller.axes.left_trigger", "ABS_Z"))
     a_v = np.stack([
-        np.asarray([r.get(k, 0.0) for k in ("move_x", "move_y", "height", "yaw", "gripper")],
-                   dtype=np.float64)
+        np.asarray(
+            [r.get(k, 0.0) for k in ("move_x", "move_y", "height", "yaw", "gripper")]
+            + [float((r.get("raw") or {}).get(_lt, 0.0) or 0.0)],
+            dtype=np.float64)
         for r in ctl
     ])
-    action, e = _pick(a_t, a_v, grid, 5); errs.append(e)
+    action, e = _pick(a_t, a_v, grid, 6); errs.append(e)
 
     # --- action.commanded: what WE asked the arm for ------------------------
     c_t, c_xyz = _series(cmd, "target_world_xyz_mm", 3)
@@ -282,12 +290,30 @@ def export_run(run_dir: Path, cfg: dict) -> dict[str, Any] | None:
     j, e = _pick(s_t, joints, grid, 7); errs.append(e)
     pb, e = _pick(pb_t, pose_base, grid, 6); errs.append(e)
     pw, e = _pick(pw_t, pose_world, grid, 3); errs.append(e)
+    # 6D ROTATION, alongside the euler angles rather than instead of them.
+    # WHY: euler angles jump 360 degrees when they wrap, and a quaternion can flip
+    # sign while describing the identical rotation. Either way a model sees an
+    # enormous change where nothing physically moved -- on lego_assemblies rpy wrapped
+    # 702/802 times per arm and quaternions flipped 29 times. The 6D form is just the
+    # first two COLUMNS of the rotation matrix: six numbers that vary smoothly, with
+    # no wrap and no sign ambiguity. The third column is their cross product, so
+    # nothing is lost. Euler stays for anyone who wants to read a number off it.
+    rot6 = None
+    if len(joints_real):
+        from .kinematics import fk_chain as _fk
+        R6 = []
+        for row in joints_real:
+            M = _fk(row)[-1][:3, :3]
+            R6.append([*M[:, 0], *M[:, 1]])          # first two columns
+        rot6_series = np.asarray(R6, dtype=np.float64)
+
     if d_base6 is not None:
         # observation.state is now ENTIRELY from the measured joints -- position and
         # orientation, base and world. The controller's own report ships untouched as
         # observation.tcp_reported_base for anyone who wants the plan.
         pb, e = _pick(d_t, d_base6, grid, 6); errs.append(e)
         pw, _ = _pick(d_t, d_world, grid, 3)
+        rot6, _ = _pick(d_t, rot6_series, grid, 6)
     gp, _ = _pick(sg_t, sg_v, grid, 1)
     if gp.size and np.all(np.isnan(gp)):
         # _grip_pos starts as NaN and stays NaN if the gripper never reported, and that
@@ -313,6 +339,14 @@ def export_run(run_dir: Path, cfg: dict) -> dict[str, Any] | None:
         # name -- exactly the class of mistake that made lego_assemblies unusable.
         "action.commanded_pose_world": np.concatenate(
             [cmd_xyz, cmd_aux[:, 1:2], cmd_aux[:, 0:1]], axis=1).astype(np.float32),   # 5
+        # Delta of the commanded world pose per grid step. Row 0 is zero by
+        # construction (there is no previous row to difference against) rather than
+        # NaN, so a consumer summing the column reconstructs the trajectory exactly.
+        "action.delta_commanded_world": np.vstack([
+            np.zeros((1, 4), dtype=np.float64),
+            np.diff(np.concatenate(
+                [cmd_xyz, cmd_aux[:, 1:2]], axis=1), axis=0),
+        ]).astype(np.float32),                                                         # 4
         "action.commanded_rpy_base": cmd_rpy.astype(np.float32),                       # 3
         "flags": np.concatenate([
             cmd_aux[:, 2:3],                                   # clamped by workspace
@@ -329,6 +363,9 @@ def export_run(run_dir: Path, cfg: dict) -> dict[str, Any] | None:
         # between them is how hard the arm was failing to follow, which is exactly the
         # signal a world model needs during contact.
         # exactly what the controller reported, untouched, for anyone who wants it
+        "observation.flange_rot6_base": (
+            rot6.astype(np.float32) if rot6 is not None
+            else np.full((n, 6), np.nan, np.float32)),
         "observation.tcp_reported_base": _pick(pb_t, pose_base, grid, 6)[0].astype(
             np.float32),
         "observation.joints_planned_deg": _pick(sp_t, joints_plan, grid, 7)[0].astype(
@@ -342,7 +379,14 @@ def export_run(run_dir: Path, cfg: dict) -> dict[str, Any] | None:
 
 
 FEATURES = {
-    "action": (5, ["move_x", "move_y", "height", "yaw", "gripper"]),
+    "action": (6, ["move_x", "move_y", "height", "yaw",
+                   "gripper_right_trigger", "left_trigger_unbound"]),
+    # Delta of the commanded WORLD pose per grid step. `action` above is stick
+    # deflection, which is a RATE -- its meaning depends on control.rate_hz,
+    # translation_rate_mm_s, the deadzone and the expo, so the same number means
+    # different motion under a different config. This delta is invariant to all of
+    # that and is what actually moved the arm. Both ship; choose at training time.
+    "action.delta_commanded_world": (4, ["dx_mm", "dy_mm", "dz_mm", "dyaw_deg"]),
     "action.commanded_pose_world": (
         5, ["x_mm", "y_mm", "z_mm", "yaw_world_deg", "gripper_closure"]),
     "action.commanded_rpy_base": (3, ["roll_deg", "pitch_deg", "yaw_deg"]),
@@ -352,6 +396,10 @@ FEATURES = {
     "flags": (4, ["clamped_by_workspace", "servo_code", "arm_error_code", "pad_connected"]),
     "action.xarm_servo_cartesian_base": (
         6, ["x_mm", "y_mm", "z_mm", "roll_deg", "pitch_deg", "yaw_deg"]),
+    # wrap-free, sign-unambiguous orientation: the first two columns of the flange's
+    # rotation matrix in the arm base frame (the third is their cross product)
+    "observation.flange_rot6_base": (
+        6, ["r11", "r21", "r31", "r12", "r22", "r32"]),
     "observation.tcp_reported_base": (
         6, ["x_mm", "y_mm", "z_mm", "roll_deg", "pitch_deg", "yaw_deg"]),
     "observation.joints_planned_deg": (
@@ -427,6 +475,7 @@ def main() -> int:
 
     episodes, ep_stats, total = [], [], 0
     cam_labels: list[str] = []
+    prov_tcp: dict | None = None
     kept = 0
     for r in runs:
         ex = export_run(r.path, cfg)
@@ -434,6 +483,12 @@ def main() -> int:
             print(f"  [skip] {r.path.name}: not enough overlapping data")
             continue
         idx = kept
+        if prov_tcp is None:
+            try:
+                prov_tcp = (json.loads((r.path / "run.json").read_text())
+                            .get("provenance") or {})
+            except Exception:
+                prov_tcp = {}
         # Was `cam_labels or ex["cams"]`, which froze the dataset's camera set from
         # whichever episode exported first; a later episode with a different set then
         # wrote videos info.json does not list, or promised ones that do not exist.
@@ -450,6 +505,8 @@ def main() -> int:
                 [v.tolist() for v in ex["observation.joints_planned_deg"]],
             "observation.tcp_reported_base":
                 [v.tolist() for v in ex["observation.tcp_reported_base"]],
+            "observation.flange_rot6_base":
+                [v.tolist() for v in ex["observation.flange_rot6_base"]],
             "action": [v.tolist() for v in ex["action"]],
             "action.commanded_pose_world": [v.tolist() for v in ex["action.commanded_pose_world"]],
             # These two were computed, declared in FEATURES, and written into
@@ -458,6 +515,8 @@ def main() -> int:
             # lego-#4 remedy (let the consumer decide instead of masking frames away),
             # so its absence silently removed the guard.
             "action.commanded_rpy_base": [v.tolist() for v in ex["action.commanded_rpy_base"]],
+            "action.delta_commanded_world":
+                [v.tolist() for v in ex["action.delta_commanded_world"]],
             "flags": [v.tolist() for v in ex["flags"]],
             "action.xarm_servo_cartesian_base":
                 [v.tolist() for v in ex["action.xarm_servo_cartesian_base"]],
@@ -573,8 +632,15 @@ def main() -> int:
         json.dumps({"task_index": 0, "task": args.task}) + "\n")
 
     print(f"\n[export] {kept} episode(s), {total} frames @ {fps:g} Hz -> {out}")
-    print("[export] action = XBOX CONTROLLER INPUT; commanded pose and the literal")
-    print("         xArm arguments are separate columns, and raw/ is still authoritative.")
+    print("[export] action = XBOX CONTROLLER INPUT (both triggers); the commanded")
+    print("         pose, its per-step delta and the literal xArm arguments are")
+    print("         separate columns, and raw/ is still authoritative.")
+    _tcp = (prov_tcp or {}).get("tcp_offset")
+    print(f"[export] END-EFFECTOR POSE IS THE FLANGE, not the fingertips.")
+    print(f"         tcp_offset = {_tcp!r}. With no tool offset configured, every")
+    print(f"         observation.state pose is the plate the gripper bolts to --")
+    print(f"         roughly 17 cm short of where the fingers actually meet.")
+    print(f"         Do not read it as a grasp point without adding that offset.")
     return 0
 
 
