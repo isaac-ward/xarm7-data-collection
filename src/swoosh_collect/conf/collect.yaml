@@ -71,6 +71,29 @@ arm:
     below_ceiling_mm: 50.0
     approach_below_horizontal_deg: 45.0
     approach_azimuth_deg: 90.0
+  # THE LEFT ARM, only so it can be parked out of the way of a right-arm campaign.
+  # This project is otherwise right-arm only and never reads or commands .219.
+  #
+  # This is the "home home" pose, NOT a calibration pose: the pre-retracted starting
+  # position from PO-Assembly-LEGO/pi05/deploy/rehome.py::HOME_DEG["left"], which that
+  # file notes is corroborated by four independent copies in manipulation-mono
+  # (xarm_sanity_check_flow, direct_teleop's starting_pose_left, calibrate_cli keyed by
+  # IP, and test_axes_synthetic). It is mirror-symmetric in j1/j3/j5/j7 with the right
+  # arm's (4, -37, -3, 49, -7, 16, -40) -- which is exactly the pose this repo's own
+  # right-arm home started from, so the two tables agree.
+  # Move it with:  swoosh-home --park-left
+  left_park:
+    ip: 192.168.1.219
+    joints_deg:
+    - -4.0
+    - -37.0
+    - 3.0
+    - 49.0
+    - 7.0
+    - 16.0
+    - 40.0
+    speed_deg_s: 20.0
+    acc_deg_s2: 150.0
 gripper:
   # Standard xArm gripper travel -- the same gripper as manipulation-mono (confirmed
   # by Isaac 2026-09-09). Proportional: trigger 0..1 maps linearly onto open..closed.

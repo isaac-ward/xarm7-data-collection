@@ -72,6 +72,88 @@ def describe(cfg: dict, joints: list[float]) -> dict:
     }
 
 
+def _park_left(cfg: dict) -> int:
+    """Park the left arm at its pre-retracted home, out of the right arm's way.
+
+    This project is right-arm only and never otherwise touches .219. Parking it is a
+    courtesy to a right-arm campaign: an arm left mid-workspace is something to collide
+    with, and collision_sensitivity is 0 so nothing would catch it.
+
+    The pose is `arm.left_park` -- PO-Assembly-LEGO's HOME_DEG["left"], mirror-symmetric
+    with the right arm's original home and corroborated by four copies in
+    manipulation-mono. See the comment in conf/collect.yaml.
+    """
+    import time
+
+    from xarm.wrapper import XArmAPI
+
+    from .utils.safety import emit_motion_warning
+
+    park = get(cfg, "arm.left_park") or {}
+    ip = str(park.get("ip", "192.168.1.219"))
+    want = [float(v) for v in park.get("joints_deg", [])]
+    if len(want) != 7:
+        print("arm.left_park.joints_deg must hold 7 angles")
+        return 1
+
+    print(f"\nLEFT arm @ {ip}")
+    print(f"  park pose {want}")
+    a = XArmAPI(ip, is_radian=False)
+    time.sleep(0.8)
+    if int(a.error_code or 0) == 1:
+        print("  EMERGENCY STOP engaged on the left arm -- release it by hand first.")
+        a.disconnect()
+        return 1
+    a.clean_warn()
+    a.clean_error()
+    try:
+        a.set_collision_sensitivity(0)
+    except Exception:
+        pass
+    a.motion_enable(enable=True)
+    a.set_mode(0)
+    a.set_state(0)
+
+    # Wait for the report stream: api.angles reads all-zeros until it publishes, and
+    # all-zeros would make the travel guard below meaningless.
+    for _ in range(60):
+        if any(abs(float(v)) > 1e-6 for v in (a.angles or [0.0])):
+            break
+        time.sleep(0.05)
+    before = [round(float(v), 1) for v in (a.angles or [])]
+    print(f"  currently {before}")
+    if len(before) >= 7:
+        travel = max(abs(w - b) for w, b in zip(want, before[:7]))
+        print(f"  largest single joint change {travel:.0f} deg")
+        # Fail closed: a huge delta means a mis-read, wrong units, or not the arm we
+        # think it is. PO-Assembly guards the same way.
+        if travel > 200.0:
+            print("  REFUSING: further than 200 deg on one joint -- check the arm.")
+            a.disconnect()
+            return 1
+        if travel < 0.5:
+            print("  already parked; nothing to do.")
+            a.disconnect()
+            return 0
+
+    emit_motion_warning(robot_name="SWOOSH LEFT", countdown=3)
+    code = a.set_servo_angle(angle=want,
+                             speed=float(park.get("speed_deg_s", 20.0)),
+                             mvacc=float(park.get("acc_deg_s2", 150.0)),
+                             wait=True, is_radian=False)
+    time.sleep(0.4)
+    after = [round(float(v), 1) for v in (a.angles or [])]
+    err = max(abs(w - x) for w, x in zip(want, after[:7])) if len(after) >= 7 else 99.0
+    print(f"  set_servo_angle -> code {code}")
+    print(f"  now at    {after}")
+    print(f"RESULT  left arm parked, worst joint error {err:.2f} deg"
+          if code == 0 and err < 1.0 else
+          f"RESULT  FAILED -- code {code}, worst joint error {err:.2f} deg")
+    a.set_state(4)      # leave it stopped, not streaming
+    a.disconnect()
+    return 0 if (code == 0 and err < 1.0) else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Solve arm.home_joints from arm.home_intent and the workspace box.")
@@ -79,7 +161,13 @@ def main() -> int:
                     help="re-solve and write arm.home_joints")
     ap.add_argument("--move", action="store_true",
                     help="with --solve, drive the arm to the new home (MOVES THE ARM)")
+    ap.add_argument("--park-left", action="store_true",
+                    help="park the LEFT arm at arm.left_park out of the way of a "
+                         "right-arm campaign (MOVES THE LEFT ARM)")
     args = ap.parse_args()
+
+    if args.park_left:
+        return _park_left(load_config())
 
     cfg = load_config()
     box = get(cfg, "control.workspace_box_mm")

@@ -157,13 +157,20 @@ export async function createArmView(container, opts = {}) {
   target.add(arrow);
   scene.add(target);
 
-  function setTarget(worldXyzMm, yawWorldDeg) {
+  // The tool's approach axis in WORLD space, refreshed every setJoints. The target
+  // arrow used to be hardcoded to point mostly straight down, which was right only
+  // while the gripper hung vertically -- with home now 45 degrees below horizontal
+  // pointing +Y, the marker pointed out of the side of the wrist. Read the real axis
+  // off the flange instead of assuming one.
+  const approachWorld = new THREE.Vector3(0, 0, -1);
+
+  function setTarget(worldXyzMm, _yawWorldDeg) {
     if (!worldXyzMm || worldXyzMm.length !== 3) { target.visible = false; return; }
     target.visible = true;
     target.position.set(worldXyzMm[0] / 1000, worldXyzMm[1] / 1000, worldXyzMm[2] / 1000);
-    // Point the arrow down (the tool's approach direction), spun by the commanded yaw.
-    const yaw = (yawWorldDeg || 0) * Math.PI / 180;
-    arrow.setDirection(new THREE.Vector3(Math.sin(yaw) * 0.35, -Math.cos(yaw) * 0.35, -1).normalize());
+    // Point along the gripper. yaw is already baked into the flange's orientation,
+    // so it needs no separate term -- which is why yawWorldDeg is now unused here.
+    arrow.setDirection(approachWorld);
   }
 
   function setJoints(jointsDeg, gripperNorm) {
@@ -171,6 +178,12 @@ export async function createArmView(container, opts = {}) {
     const T = fk(jointsDeg);
     for (let i = 0; i < linkGroups.length; i++) applyTo(linkGroups[i], T[i], THREE);
     applyTo(flange, T[7], THREE);
+    // Tool +Z in world coordinates = third column of the flange's world matrix.
+    // mountRoot carries the 45-degree physical tilt, so going through the world
+    // matrix picks that up for free.
+    flange.updateMatrixWorld(true);
+    const m = flange.matrixWorld.elements;      // column-major
+    approachWorld.set(m[8], m[9], m[10]).normalize();
     if (gripper) gripper.set(gripperNorm === undefined ? 1 : gripperNorm);
   }
 
