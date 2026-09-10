@@ -239,6 +239,13 @@ recording:
   # DO NOT shift the image stream to compensate: it is 2.7 frames at 30 Hz, so you
   # would be rounding an estimate into the data. It is recorded per run instead.
   camera_align_warn_ms: 120.0
+  # Fraction of control ticks allowed to exceed ONE EXPORT BIN (1/export_rate_hz,
+  # i.e. 33.3 ms) before the health check warns. Deliberately NOT a multiple of the
+  # control period: a tick slower than 15 ms is invisible to a 30 Hz dataset, because
+  # nearest-in-time resampling absorbs any jitter inside a bin. Only a tick spanning a
+  # whole bin can misplace a sample. The old 1.5x-period / 5% form warned on two
+  # perfectly good runs when p95 crept from 13.9 to 15.4 ms. Typical here is ~0.02%.
+  loop_overrun_warn_frac: 0.01
 dashboard:
   refresh_hz: 15.0
   port: 8770

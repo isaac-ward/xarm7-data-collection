@@ -303,12 +303,31 @@ def validate_run(run_dir: Path, cfg: dict) -> dict[str, Any]:
         out.append(_r(f"{nm} rate", lvl, f"{r:.1f} Hz (expected ~{float(want):.0f})", hz=r))
 
     # 4. loop health
+    #
+    # WHAT THIS MEASURES, AND WHY IT CHANGED. It used to count ticks slower than 1.5x
+    # the control period (15 ms at 100 Hz) and warn past 5%. That fraction drifted
+    # 3.9% -> 5.4% over a 1.5 h session purely because p95 crept from 13.9 to 15.4 ms,
+    # tripping a hard threshold while the loop still held a 10.00 ms median. It flagged
+    # two runs whose data was untouched.
+    #
+    # The number that can actually corrupt the dataset is a tick longer than ONE EXPORT
+    # BIN: the LeRobot grid is 30 Hz, so nearest-in-time resampling absorbs any jitter
+    # inside 33.3 ms completely, and only a tick that spans a whole bin can misplace a
+    # sample. Measured against that, the same two runs sit at 0.02%.
+    #
+    # p95 stays in the detail so the drift the old check was picking up is still
+    # visible -- re-aimed, not loosened.
     if tk:
         dts = np.array([x.get("dt", 0.0) for x in tk], dtype=float)
-        over = float((dts > 1.5 / float(get(cfg, "control.rate_hz", 100.0))).mean())
-        out.append(_r("loop timing", "pass" if over < 0.05 else "warn",
-                      f"{100*over:.1f}% of ticks overran; median dt "
-                      f"{1000*float(np.median(dts)):.1f} ms", overrun_frac=over))
+        bin_s = 1.0 / float(get(cfg, "recording.export_rate_hz", 30.0))
+        over = float((dts > bin_s).mean())
+        thresh = float(get(cfg, "recording.loop_overrun_warn_frac", 0.01))
+        p95 = float(np.percentile(dts, 95)) if len(dts) else 0.0
+        out.append(_r("loop timing", "pass" if over <= thresh else "warn",
+                      f"{100*over:.2f}% of ticks exceeded one {1000*bin_s:.1f} ms "
+                      f"export bin (warns past {100*thresh:.0f}%); median "
+                      f"{1000*float(np.median(dts)):.1f} ms, p95 {1000*p95:.1f} ms",
+                      overrun_frac=over, p95_dt_ms=1000*p95))
 
     # 5. the lego-2 detector: commanded must predict measured at a sane lag
     lags, meds = lag_curve(cmd, stt)
