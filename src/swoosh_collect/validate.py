@@ -20,7 +20,7 @@ from typing import Any
 
 import numpy as np
 
-from .campaign import Campaign
+from .campaign import Campaign, set_run_status
 from .config import get, load_config
 from .summarize import _read_jsonl
 
@@ -446,10 +446,19 @@ def main() -> int:
             col = {"pass": GREEN, "warn": YEL, "fail": RED}[ch["level"]]
             mark = {"pass": "✓", "warn": "!", "fail": "✗"}[ch["level"]]
             print(f"  {col}{mark}{RESET} {ch['check']:32s} {DIM}{ch['detail']}{RESET}")
-        # store it so the exporter can refuse a bad run
-        meta = json.loads((r.path / "run.json").read_text()) if (r.path / "run.json").is_file() else {}
-        meta["validation"] = res
-        (r.path / "run.json").write_text(json.dumps(meta, indent=2))
+        # Store the WHOLE verdict, not just the check list. The run card and the
+        # campaign API read the top-level counts; writing only `validation` left them
+        # showing whatever the collector recorded at the time, so a re-check against a
+        # changed threshold silently appeared to do nothing -- and the data looked
+        # broken to anyone reading it later. Same fields, same order as _health_check.
+        fails = [ch["check"] for ch in res["checks"] if ch["level"] == "fail"]
+        warns = [ch["check"] for ch in res["checks"] if ch["level"] == "warn"]
+        status = json.loads((r.path / "run.json").read_text()).get("status", "ready") \
+            if (r.path / "run.json").is_file() else "ready"
+        set_run_status(r.path, status, validation=res, checks_ok=bool(res["ok"]),
+                       checks_reasons=fails + warns,
+                       checks_pass=res["n_pass"], checks_total=res["n_total"],
+                       checks_green=bool(res["all_green"]))
         bad += not res["ok"]
     print(f"\n{len(runs) - bad}/{len(runs)} runs passed")
     return 1 if bad else 0
